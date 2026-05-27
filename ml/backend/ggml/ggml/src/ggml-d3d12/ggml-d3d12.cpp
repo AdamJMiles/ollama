@@ -33,6 +33,9 @@
 #include "d3d12-root-sigs.hpp"
 #include "d3d12-quant.hpp"
 
+#include "d3d12-ops-common.hpp"
+#include "d3d12-ops-memops.hpp"
+
 #ifndef GGML_D3D12_HAS_SHADERS
 #if __has_include("ggml-d3d12-shaders.hpp")
 #include "ggml-d3d12-shaders.hpp"
@@ -971,6 +974,126 @@ static void ggml_backend_d3d12_synchronize(ggml_backend_t backend) {
     (void) d3d12_signal_and_wait_locked(ctx->dev);
 }
 
+// ============================================================================
+// dispatch_ctx helper implementations (declared in d3d12-ops-common.hpp).
+// These are the only path through which op-category headers reach
+// d3d12_device / d3d12_buffer internals.
+// ============================================================================
+
+namespace ggml_d3d12 {
+
+static d3d12_buffer * resolve_buffer(const ggml_tensor * tensor) {
+    if (tensor == nullptr) return nullptr;
+    ggml_backend_buffer_t buf_b = d3d12_tensor_buffer(tensor);
+    if (buf_b == nullptr) return nullptr;
+    return static_cast<d3d12_buffer *>(buf_b->context);
+}
+
+tensor_resource ctx_resolve_tensor(dispatch_ctx & ctx, const ggml_tensor * tensor) {
+    tensor_resource out{};
+    d3d12_device * dev = static_cast<d3d12_device *>(ctx.dev_opaque);
+    if (dev == nullptr) return out;
+
+    d3d12_buffer * buf = resolve_buffer(tensor);
+    if (buf == nullptr) return out;
+    if (buf->host) return out;
+    if (buf->dev != dev) return out;
+    if (!buf->resource) return out;
+
+    out.resource          = buf->resource.Get();
+    out.offset_bytes      = d3d12_tensor_offset(buf, tensor, 0);
+    out.buffer_size_bytes = buf->size;
+    out.valid             = true;
+    return out;
+}
+
+bool ctx_transition(dispatch_ctx & ctx, const ggml_tensor * tensor, D3D12_RESOURCE_STATES after) {
+    d3d12_device * dev = static_cast<d3d12_device *>(ctx.dev_opaque);
+    if (dev == nullptr || ctx.cmd == nullptr) return false;
+    d3d12_buffer * buf = resolve_buffer(tensor);
+    if (buf == nullptr || buf->dev != dev) return false;
+    d3d12_transition(ctx.cmd, buf, after);
+    return true;
+}
+
+void ctx_uav_barrier(dispatch_ctx & ctx, const ggml_tensor * tensor) {
+    if (ctx.cmd == nullptr) return;
+    d3d12_buffer * buf = resolve_buffer(tensor);
+    if (buf == nullptr || !buf->resource) return;
+    D3D12_RESOURCE_BARRIER barrier = {};
+    barrier.Type        = D3D12_RESOURCE_BARRIER_TYPE_UAV;
+    barrier.UAV.pResource = buf->resource.Get();
+    ctx.cmd->ResourceBarrier(1, &barrier);
+}
+
+bool ctx_bind_raw_uavs(dispatch_ctx & ctx,
+                       const ggml_tensor * const * tensors,
+                       size_t count,
+                       D3D12_GPU_DESCRIPTOR_HANDLE * out_table_gpu) {
+    if (ctx.device == nullptr || ctx.uav_heap == nullptr || out_table_gpu == nullptr) return false;
+    if (count == 0 || count > std::numeric_limits<uint32_t>::max()) return false;
+
+    desc_range r = ctx.uav_heap->allocate(static_cast<uint32_t>(count));
+    if (!r.base.valid) return false;
+
+    D3D12_UNORDERED_ACCESS_VIEW_DESC uav_desc = {};
+    uav_desc.ViewDimension                  = D3D12_UAV_DIMENSION_BUFFER;
+    uav_desc.Format                         = DXGI_FORMAT_R32_TYPELESS;
+    uav_desc.Buffer.FirstElement            = 0;
+    uav_desc.Buffer.StructureByteStride     = 0;
+    uav_desc.Buffer.CounterOffsetInBytes    = 0;
+    uav_desc.Buffer.Flags                   = D3D12_BUFFER_UAV_FLAG_RAW;
+
+    for (size_t i = 0; i < count; ++i) {
+        tensor_resource res = ctx_resolve_tensor(ctx, tensors[i]);
+        if (!res.valid) return false;
+        uav_desc.Buffer.NumElements = static_cast<UINT>(res.buffer_size_bytes / 4);
+        D3D12_CPU_DESCRIPTOR_HANDLE cpu = { r.base.cpu.ptr + r.stride * static_cast<UINT>(i) };
+        ctx.device->CreateUnorderedAccessView(res.resource, nullptr, &uav_desc, cpu);
+    }
+    *out_table_gpu = r.base.gpu;
+    return true;
+}
+
+ID3D12RootSignature * ctx_get_root_sig(dispatch_ctx & ctx,
+                                       uint8_t uav_count,
+                                       uint8_t root_constants_dwords) {
+    if (ctx.root_sigs == nullptr) return nullptr;
+    return ctx.root_sigs->get(uav_count, root_constants_dwords);
+}
+
+bool ctx_bind_compute(dispatch_ctx & ctx,
+                      ID3D12PipelineState * pso,
+                      ID3D12RootSignature * root_sig,
+                      D3D12_GPU_DESCRIPTOR_HANDLE uav_table,
+                      uint8_t uav_count,
+                      const UINT * constants,
+                      uint8_t constants_dwords) {
+    if (ctx.cmd == nullptr || pso == nullptr || root_sig == nullptr) return false;
+    ctx.cmd->SetComputeRootSignature(root_sig);
+    ctx.cmd->SetPipelineState(pso);
+    if (uav_count > 0) {
+        const UINT slot = root_sig_cache::uav_table_param_index(uav_count);
+        if (slot == UINT_MAX) return false;
+        ctx.cmd->SetComputeRootDescriptorTable(slot, uav_table);
+    }
+    if (constants_dwords > 0) {
+        if (constants == nullptr) return false;
+        const UINT slot = root_sig_cache::root_constants_param_index(uav_count, constants_dwords);
+        if (slot == UINT_MAX) return false;
+        ctx.cmd->SetComputeRoot32BitConstants(slot, constants_dwords, constants, 0);
+    }
+    return true;
+}
+
+void ctx_dispatch_1d(dispatch_ctx & ctx, UINT threads, UINT threads_per_group) {
+    if (ctx.cmd == nullptr || threads == 0 || threads_per_group == 0) return;
+    const UINT groups = (threads + threads_per_group - 1) / threads_per_group;
+    ctx.cmd->Dispatch(groups, 1, 1);
+}
+
+} // namespace ggml_d3d12
+
 static enum ggml_status ggml_backend_d3d12_graph_compute(ggml_backend_t backend, struct ggml_cgraph * cgraph, int batch_size) {
     GGML_UNUSED(batch_size);
 
@@ -984,30 +1107,27 @@ static enum ggml_status ggml_backend_d3d12_graph_compute(ggml_backend_t backend,
 #else
     d3d12_device * dev = ctx->dev;
 
-    ID3D12RootSignature * root_sig = dev->root_sigs.get(/*uav=*/2, /*dwords=*/4);
-    if (root_sig == nullptr) {
-        GGML_LOG_ERROR("ggml_d3d12: failed to create root signature\n");
-        return GGML_STATUS_FAILED;
-    }
-    ID3D12PipelineState * pso_copy = dev->psos.get("copy_f32", root_sig, {});
-    if (pso_copy == nullptr) {
-        GGML_LOG_ERROR("ggml_d3d12: failed to create copy_f32 PSO\n");
-        return GGML_STATUS_FAILED;
-    }
-
     std::lock_guard<std::mutex> lock(dev->submit_mutex);
     if (!d3d12_begin_commands_locked(dev)) return GGML_STATUS_FAILED;
 
+    // Bind the descriptor heap once for the whole graph. Each op handler
+    // sets its own root signature + PSO + bindings.
     ID3D12DescriptorHeap * heaps[] = { dev->uav_heap.heap() };
     dev->cmd->SetDescriptorHeaps(1, heaps);
-    dev->cmd->SetComputeRootSignature(root_sig);
 
-    bool dispatched_any = false;
+    ggml_d3d12::dispatch_ctx dctx;
+    dctx.dev_opaque = dev;
+    dctx.device     = dev->device.Get();
+    dctx.cmd        = dev->cmd.Get();
+    dctx.uav_heap   = &dev->uav_heap;
+    dctx.psos       = &dev->psos;
+    dctx.root_sigs  = &dev->root_sigs;
 
     for (int i = 0; i < cgraph->n_nodes; ++i) {
         ggml_tensor * node = cgraph->nodes[i];
         if (node == nullptr) continue;
 
+        // Metadata-only ops do nothing at execution time.
         switch (node->op) {
             case GGML_OP_NONE:
             case GGML_OP_RESHAPE:
@@ -1015,80 +1135,21 @@ static enum ggml_status ggml_backend_d3d12_graph_compute(ggml_backend_t backend,
             case GGML_OP_PERMUTE:
             case GGML_OP_TRANSPOSE:
                 continue;
-            case GGML_OP_CPY:
-            case GGML_OP_DUP: {
-                ggml_tensor * src_t = node->src[0];
-                ggml_tensor * dst_t = node;
-                if (src_t == nullptr) return GGML_STATUS_FAILED;
-
-                ggml_backend_buffer_t src_buf_b = d3d12_tensor_buffer(src_t);
-                ggml_backend_buffer_t dst_buf_b = d3d12_tensor_buffer(dst_t);
-                if (src_buf_b == nullptr || dst_buf_b == nullptr) return GGML_STATUS_FAILED;
-
-                d3d12_buffer * src_b = static_cast<d3d12_buffer *>(src_buf_b->context);
-                d3d12_buffer * dst_b = static_cast<d3d12_buffer *>(dst_buf_b->context);
-                if (src_b->host || dst_b->host) return GGML_STATUS_FAILED;
-                if (src_b->dev != dev || dst_b->dev != dev) return GGML_STATUS_FAILED;
-
-                const size_t src_off = d3d12_tensor_offset(src_b, src_t, 0);
-                const size_t dst_off = d3d12_tensor_offset(dst_b, dst_t, 0);
-                const size_t bytes = ggml_nbytes(src_t);
-                if (bytes == 0) continue;
-                if ((bytes % 4) != 0 || (src_off % 4) != 0 || (dst_off % 4) != 0) return GGML_STATUS_FAILED;
-                if (bytes > std::numeric_limits<UINT>::max() || src_off > std::numeric_limits<UINT>::max() || dst_off > std::numeric_limits<UINT>::max()) return GGML_STATUS_FAILED;
-
-                d3d12_transition(dev->cmd.Get(), src_b, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
-                d3d12_transition(dev->cmd.Get(), dst_b, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
-
-                ggml_d3d12::desc_range r = dev->uav_heap.allocate(2);
-                if (!r.base.valid) return GGML_STATUS_FAILED;
-
-                D3D12_UNORDERED_ACCESS_VIEW_DESC uav_desc = {};
-                uav_desc.ViewDimension = D3D12_UAV_DIMENSION_BUFFER;
-                uav_desc.Format = DXGI_FORMAT_R32_TYPELESS;
-                uav_desc.Buffer.FirstElement = 0;
-                uav_desc.Buffer.NumElements = static_cast<UINT>(src_b->size / 4);
-                uav_desc.Buffer.StructureByteStride = 0;
-                uav_desc.Buffer.CounterOffsetInBytes = 0;
-                uav_desc.Buffer.Flags = D3D12_BUFFER_UAV_FLAG_RAW;
-
-                D3D12_CPU_DESCRIPTOR_HANDLE src_cpu = r.base.cpu;
-                D3D12_CPU_DESCRIPTOR_HANDLE dst_cpu = { src_cpu.ptr + r.stride };
-                D3D12_GPU_DESCRIPTOR_HANDLE table_gpu = r.base.gpu;
-
-                dev->device->CreateUnorderedAccessView(src_b->resource.Get(), nullptr, &uav_desc, src_cpu);
-                uav_desc.Buffer.NumElements = static_cast<UINT>(dst_b->size / 4);
-                dev->device->CreateUnorderedAccessView(dst_b->resource.Get(), nullptr, &uav_desc, dst_cpu);
-
-                dev->cmd->SetPipelineState(pso_copy);
-                dev->cmd->SetComputeRootDescriptorTable(
-                    ggml_d3d12::root_sig_cache::uav_table_param_index(2), table_gpu);
-
-                UINT consts[4] = {
-                    static_cast<UINT>(bytes),
-                    static_cast<UINT>(src_off),
-                    static_cast<UINT>(dst_off),
-                    0,
-                };
-                dev->cmd->SetComputeRoot32BitConstants(
-                    ggml_d3d12::root_sig_cache::root_constants_param_index(2, 4),
-                    4, consts, 0);
-
-                const UINT dwords = static_cast<UINT>(bytes / 4);
-                const UINT groups = (dwords + 255) / 256;
-                dev->cmd->Dispatch(groups, 1, 1);
-
-                D3D12_RESOURCE_BARRIER uav_barrier = {};
-                uav_barrier.Type = D3D12_RESOURCE_BARRIER_TYPE_UAV;
-                uav_barrier.UAV.pResource = dst_b->resource.Get();
-                dev->cmd->ResourceBarrier(1, &uav_barrier);
-
-                dispatched_any = true;
-                break;
-            }
             default:
-                GGML_LOG_ERROR("ggml_d3d12: unsupported op %s in graph_compute\n", ggml_op_name(node->op));
-                return GGML_STATUS_FAILED;
+                break;
+        }
+
+        // === op dispatchers (one per category) ===
+        // Each handler returns true if it claimed the op (whether it
+        // succeeded or logged a failure). New Phase 5 op groups append
+        // their dispatch_<cat> call here.
+        bool handled = false;
+        if (!handled && ggml_d3d12::dispatch_memops(dctx, node)) handled = true;
+        // === end op dispatchers ===
+
+        if (!handled) {
+            GGML_LOG_ERROR("ggml_d3d12: unsupported op %s in graph_compute\n", ggml_op_name(node->op));
+            return GGML_STATUS_FAILED;
         }
     }
 
@@ -1098,7 +1159,6 @@ static enum ggml_status ggml_backend_d3d12_graph_compute(ggml_backend_t backend,
     dev->uav_heap.mark_used(dev->fence_value.load());
     dev->uav_heap.reclaim_to(dev->fence_value.load());
 
-    GGML_UNUSED(dispatched_any);
     return GGML_STATUS_SUCCESS;
 #endif
 }
@@ -1276,6 +1336,9 @@ static ggml_backend_buffer_type_t ggml_backend_d3d12_device_get_host_buffer_type
 
 static bool ggml_backend_d3d12_device_supports_op(ggml_backend_dev_t dev, const struct ggml_tensor * op) {
     GGML_UNUSED(dev);
+    if (op == nullptr) return false;
+
+    // Metadata-only ops are always supported.
     switch (op->op) {
         case GGML_OP_NONE:
         case GGML_OP_RESHAPE:
@@ -1283,17 +1346,16 @@ static bool ggml_backend_d3d12_device_supports_op(ggml_backend_dev_t dev, const 
         case GGML_OP_PERMUTE:
         case GGML_OP_TRANSPOSE:
             return true;
-        case GGML_OP_CPY:
-        case GGML_OP_DUP:
-            if (op->src[0] == nullptr) return false;
-            if (op->src[0]->type != GGML_TYPE_F32 || op->type != GGML_TYPE_F32) return false;
-            if (!ggml_is_contiguous(op->src[0])) return false;
-            if (!ggml_is_contiguous(op)) return false;
-            if (ggml_nelements(op) != ggml_nelements(op->src[0])) return false;
-            return true;
         default:
-            return false;
+            break;
     }
+
+    // === op support checks (one per category) ===
+    // New Phase 5 op groups append their supports_op_<cat> call here.
+    if (ggml_d3d12::supports_op_memops(op)) return true;
+    // === end op support checks ===
+
+    return false;
 }
 
 static bool ggml_backend_d3d12_device_supports_buft(ggml_backend_dev_t dev, ggml_backend_buffer_type_t buft) {
