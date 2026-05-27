@@ -35,6 +35,8 @@
 
 #include "d3d12-ops-common.hpp"
 #include "d3d12-ops-memops.hpp"
+#include "d3d12-ops-unary.hpp"
+#include "d3d12-ops-binary.hpp"
 
 #ifndef GGML_D3D12_HAS_SHADERS
 #if __has_include("ggml-d3d12-shaders.hpp")
@@ -1145,6 +1147,8 @@ static enum ggml_status ggml_backend_d3d12_graph_compute(ggml_backend_t backend,
         // their dispatch_<cat> call here.
         bool handled = false;
         if (!handled && ggml_d3d12::dispatch_memops(dctx, node)) handled = true;
+        if (!handled && ggml_d3d12::dispatch_unary(dctx, node))  handled = true;
+        if (!handled && ggml_d3d12::dispatch_binary(dctx, node)) handled = true;
         // === end op dispatchers ===
 
         if (!handled) {
@@ -1353,6 +1357,8 @@ static bool ggml_backend_d3d12_device_supports_op(ggml_backend_dev_t dev, const 
     // === op support checks (one per category) ===
     // New Phase 5 op groups append their supports_op_<cat> call here.
     if (ggml_d3d12::supports_op_memops(op)) return true;
+    if (ggml_d3d12::supports_op_unary(op))  return true;
+    if (ggml_d3d12::supports_op_binary(op)) return true;
     // === end op support checks ===
 
     return false;
