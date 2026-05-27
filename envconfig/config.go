@@ -234,6 +234,8 @@ var (
 	UseAuth = Bool("OLLAMA_AUTH")
 	// Enable Vulkan backend
 	EnableVulkan = Bool("OLLAMA_VULKAN")
+	// Enable D3D12 backend
+	EnableD3D12 = Bool("OLLAMA_D3D12")
 	// NoCloudEnv checks the OLLAMA_NO_CLOUD environment variable.
 	NoCloudEnv = Bool("OLLAMA_NO_CLOUD")
 )
@@ -252,6 +254,7 @@ var (
 	HipVisibleDevices     = String("HIP_VISIBLE_DEVICES")
 	RocrVisibleDevices    = String("ROCR_VISIBLE_DEVICES")
 	VkVisibleDevices      = String("GGML_VK_VISIBLE_DEVICES")
+	D3D12VisibleDevices   = String("GGML_D3D12_VISIBLE_DEVICES")
 	GpuDeviceOrdinal      = String("GPU_DEVICE_ORDINAL")
 	HsaOverrideGfxVersion = String("HSA_OVERRIDE_GFX_VERSION")
 )
@@ -353,9 +356,15 @@ func AsMap() map[string]EnvVar {
 		ret["HIP_VISIBLE_DEVICES"] = EnvVar{"HIP_VISIBLE_DEVICES", HipVisibleDevices(), "Set which AMD devices are visible by numeric ID"}
 		ret["ROCR_VISIBLE_DEVICES"] = EnvVar{"ROCR_VISIBLE_DEVICES", RocrVisibleDevices(), "Set which AMD devices are visible by UUID or numeric ID"}
 		ret["GGML_VK_VISIBLE_DEVICES"] = EnvVar{"GGML_VK_VISIBLE_DEVICES", VkVisibleDevices(), "Set which Vulkan devices are visible by numeric ID"}
+		if runtime.GOOS == "windows" {
+			ret["GGML_D3D12_VISIBLE_DEVICES"] = EnvVar{"GGML_D3D12_VISIBLE_DEVICES", D3D12VisibleDevices(), "Set which D3D12 devices are visible by numeric ID"}
+		}
 		ret["GPU_DEVICE_ORDINAL"] = EnvVar{"GPU_DEVICE_ORDINAL", GpuDeviceOrdinal(), "Set which AMD devices are visible by numeric ID"}
 		ret["HSA_OVERRIDE_GFX_VERSION"] = EnvVar{"HSA_OVERRIDE_GFX_VERSION", HsaOverrideGfxVersion(), "Override the gfx used for all detected AMD GPUs"}
 		ret["OLLAMA_VULKAN"] = EnvVar{"OLLAMA_VULKAN", EnableVulkan(), "Enable experimental Vulkan support"}
+		if runtime.GOOS == "windows" {
+			ret["OLLAMA_D3D12"] = EnvVar{"OLLAMA_D3D12", EnableD3D12(), "Enable experimental D3D12 support"}
+		}
 	}
 
 	return ret

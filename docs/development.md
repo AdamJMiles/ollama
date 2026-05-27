@@ -44,6 +44,7 @@ Install prerequisites:
 
 - [CMake](https://cmake.org/download/)
 - [Visual Studio 2022](https://visualstudio.microsoft.com/downloads/) including the Native Desktop Workload
+- [mingw-w64 GCC](https://www.mingw-w64.org/downloads/) for Go cgo builds; ensure `gcc` is in `PATH`. Without it, cgo can be disabled and lead to misleading errors such as `undefined: mlx.Array`.
 - (Optional) AMD GPU support
     - [ROCm](https://rocm.docs.amd.com/en/latest/)
     - [Ninja](https://github.com/ninja-build/ninja/releases)
@@ -51,6 +52,9 @@ Install prerequisites:
     - [CUDA SDK](https://developer.nvidia.com/cuda-downloads?target_os=Windows&target_arch=x86_64&target_version=11&target_type=exe_network)
 - (Optional) VULKAN GPU support
     - [VULKAN SDK](https://vulkan.lunarg.com/sdk/home) - useful for AMD/Intel GPUs
+- (Optional) Direct3D 12 GPU support
+    - Windows SDK 10.0.26100 or newer for DXC (DirectX Shader Compiler, `dxc.exe`), for example `C:\Program Files (x86)\Windows Kits\10\bin\10.0.26100.0\x64\dxc.exe` (path may vary)
+    - CMake auto-detects D3D12 when `D3D12.lib`, `DXGI.lib`, and `dxc.exe` are present; otherwise it is skipped
 - (Optional) MLX engine support
     - [CUDA 13+ SDK](https://developer.nvidia.com/cuda-downloads)
     - [cuDNN 9+](https://developer.nvidia.com/cudnn)

@@ -488,7 +488,8 @@ func FlashAttentionSupported(l []DeviceInfo) bool {
 			gpu.Name == "Metal" || gpu.Library == "Metal" ||
 			(gpu.Library == "CUDA" && gpu.DriverMajor >= 7 && !(gpu.ComputeMajor == 7 && gpu.ComputeMinor == 2)) ||
 			gpu.Library == "ROCm" ||
-			gpu.Library == "Vulkan"
+			gpu.Library == "Vulkan" ||
+			gpu.Library == "D3D12"
 
 		if !supportsFA {
 			return false
@@ -561,7 +562,7 @@ func (d DeviceInfo) AddInitValidation(env map[string]string) {
 
 // PreferredLibrary returns true if this library is preferred over the other input
 // library
-// Used to filter out Vulkan in favor of CUDA or ROCm
+// Used to filter out Vulkan/D3D12 in favor of CUDA or ROCm
 func (d DeviceInfo) PreferredLibrary(other DeviceInfo) bool {
 	// TODO in the future if we find Vulkan is better than ROCm on some devices
 	// that implementation can live here.
@@ -589,7 +590,7 @@ func (d DeviceInfo) updateVisibleDevicesEnv(env map[string]string, mustFilter bo
 		}
 		envVar = "CUDA_VISIBLE_DEVICES"
 	default:
-		// Vulkan is not filtered via env var, but via scheduling decisions
+		// Vulkan and D3D12 are not filtered via env var, but via scheduling decisions
 		return
 	}
 	v, existing := env[envVar]
