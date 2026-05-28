@@ -42,16 +42,13 @@ float load_f16(RWByteAddressBuffer buf, uint off) {
     return f16tof32(load_u16(buf, off));
 }
 
-// Dequantize Q8_0 element at (row_base, k) where row_base is the byte offset
-// of the row start in the global src0 buffer. Q8_0 blocks are 34 bytes:
-// [f16 scale][32 x int8 values]. Each row contains (K / 32) blocks.
 float load_q8_0(uint row_base, uint k) {
     const uint block    = k / Q8_QK;
     const uint elem     = k & (Q8_QK - 1u);
     const uint block_off = row_base + block * Q8_BLOCK_SIZE;
     const float scale   = load_f16(src0_buf, block_off);
     const uint  byte_q  = load_u8(src0_buf, block_off + Q8_QS_OFFSET + elem);
-    const int   q       = (int(byte_q) << 24) >> 24;
+    const int   q       = (byte_q < 128u) ? int(byte_q) : (int(byte_q) - 256);
     return float(q) * scale;
 }
 

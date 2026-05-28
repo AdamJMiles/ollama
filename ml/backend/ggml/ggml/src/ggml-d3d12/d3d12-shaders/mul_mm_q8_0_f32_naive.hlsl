@@ -44,7 +44,7 @@ float load_q8_0(uint row_base, uint k) {
     const uint block_off = row_base + block * Q8_BLOCK_SIZE;
     const float scale    = load_f16(src0_buf, block_off);
     const uint  byte_q   = load_u8(src0_buf, block_off + Q8_QS_OFFSET + elem);
-    const int   q        = (int(byte_q) << 24) >> 24;
+    const int   q        = (byte_q < 128u) ? int(byte_q) : (int(byte_q) - 256);
     return float(q) * scale;
 }
 
