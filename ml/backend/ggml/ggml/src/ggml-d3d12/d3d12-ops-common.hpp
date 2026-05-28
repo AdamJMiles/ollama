@@ -102,6 +102,19 @@ bool ctx_bind_raw_uavs_resolved(dispatch_ctx & ctx,
                                 size_t count,
                                 D3D12_GPU_DESCRIPTOR_HANDLE * out_table_gpu);
 
+// Like ctx_bind_raw_uavs but creates each UAV with FirstElement set to slide
+// the addressable window to the tensor's start within its parent buffer.
+// out_offsets[i] receives the byte offset (within the UAV view) that the
+// caller should pass to its shader; this is always 0 for 4-byte-aligned
+// tensors. Allows addressing tensors that live past the 4 GB shader-uint
+// boundary in a > 4 GB parent buffer (e.g. Q8_0 model weights staged into
+// a single 7 GB scratch buffer).
+bool ctx_bind_raw_uavs_sliding(dispatch_ctx & ctx,
+                               const ggml_tensor * const * tensors,
+                               size_t count,
+                               D3D12_GPU_DESCRIPTOR_HANDLE * out_table_gpu,
+                               uint32_t * out_offsets);
+
 // Reset the per-graph transfer scratch bump allocator. Called once at the
 // start of each graph_compute by ggml_backend_d3d12_graph_compute.
 void ctx_scratch_reset(dispatch_ctx & ctx);

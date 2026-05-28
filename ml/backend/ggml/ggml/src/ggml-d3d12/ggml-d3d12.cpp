@@ -1382,6 +1382,58 @@ bool ctx_bind_raw_uavs_resolved(dispatch_ctx & ctx,
     return true;
 }
 
+// ctx_bind_raw_uavs_sliding
+// Like ctx_bind_raw_uavs, but each UAV's FirstElement is set so that shader
+// address 0 corresponds to the tensor's start within its parent buffer. This
+// lets us address tensors that live past the 4 GB shader-uint boundary when
+// they share a > 4 GB buffer (e.g. Q8_0 model weights staged into a single
+// 7 GB scratch buffer).
+//
+// On success, out_offsets[i] is populated with the byte offset the caller
+// should use for that tensor in the shader cbuffer (always 0 + a residue for
+// 4-byte alignment, since FirstElement must be 4-byte aligned). The total
+// addressable range from the shader is then [0, min(4 GB, tensor_extent)).
+bool ctx_bind_raw_uavs_sliding(dispatch_ctx & ctx,
+                               const ggml_tensor * const * tensors,
+                               size_t count,
+                               D3D12_GPU_DESCRIPTOR_HANDLE * out_table_gpu,
+                               uint32_t * out_offsets) {
+    if (ctx.device == nullptr || ctx.uav_heap == nullptr || out_table_gpu == nullptr || out_offsets == nullptr) return false;
+    if (count == 0 || count > std::numeric_limits<uint32_t>::max()) return false;
+
+    desc_range r = ctx.uav_heap->allocate(static_cast<uint32_t>(count));
+    if (!r.base.valid) return false;
+
+    D3D12_UNORDERED_ACCESS_VIEW_DESC uav_desc = {};
+    uav_desc.ViewDimension               = D3D12_UAV_DIMENSION_BUFFER;
+    uav_desc.Format                      = DXGI_FORMAT_R32_TYPELESS;
+    uav_desc.Buffer.StructureByteStride  = 0;
+    uav_desc.Buffer.CounterOffsetInBytes = 0;
+    uav_desc.Buffer.Flags                = D3D12_BUFFER_UAV_FLAG_RAW;
+
+    for (size_t i = 0; i < count; ++i) {
+        tensor_resource res = ctx_resolve_tensor(ctx, tensors[i]);
+        if (!res.valid) return false;
+
+        // Slide FirstElement to a 4-byte aligned boundary covering the
+        // tensor; the residue (offset_bytes % 4) becomes the in-shader
+        // starting offset. For correctly-aligned tensors the residue is 0.
+        const uint64_t first_byte    = static_cast<uint64_t>(res.offset_bytes) & ~uint64_t{3};
+        const uint64_t residue_bytes = static_cast<uint64_t>(res.offset_bytes) - first_byte;
+        const uint64_t remaining     = static_cast<uint64_t>(res.buffer_size_bytes) - first_byte;
+        const uint64_t num_elements  = (remaining > (uint64_t{1} << 32)) ? (uint64_t{1} << 32) / 4 : remaining / 4;
+
+        uav_desc.Buffer.FirstElement = first_byte / 4;
+        uav_desc.Buffer.NumElements  = static_cast<UINT>(num_elements);
+
+        D3D12_CPU_DESCRIPTOR_HANDLE cpu = { r.base.cpu.ptr + r.stride * static_cast<UINT>(i) };
+        ctx.device->CreateUnorderedAccessView(res.resource, nullptr, &uav_desc, cpu);
+        out_offsets[i] = static_cast<uint32_t>(residue_bytes);
+    }
+    *out_table_gpu = r.base.gpu;
+    return true;
+}
+
 // --- Transfer scratch buffer management -------------------------------------
 // scratch_upload: UPLOAD heap, mapped, used as CPU staging when source data
 //                 lives in CPU (non-D3D12) memory.

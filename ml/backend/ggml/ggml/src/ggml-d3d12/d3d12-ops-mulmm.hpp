@@ -130,7 +130,9 @@ inline bool dispatch_mulmm(dispatch_ctx & ctx, const ggml_tensor * node) {
     const uint64_t gx = (N + 31u) / 32u;
     const uint64_t gy = (M + 31u) / 32u;
     const uint64_t gz = batch;
-    if (!mulmm_dispatch_dim(gx) || !mulmm_dispatch_dim(gy) || !mulmm_dispatch_dim(gz)) return true;
+    if (!mulmm_dispatch_dim(gx) || !mulmm_dispatch_dim(gy) || !mulmm_dispatch_dim(gz)) {
+        return true;
+    }
 
     const tensor_resource s0r = ctx_resolve_tensor(ctx, src0);
     const tensor_resource s1r = ctx_resolve_tensor(ctx, src1);
@@ -140,9 +142,13 @@ inline bool dispatch_mulmm(dispatch_ctx & ctx, const ggml_tensor * node) {
     const uint64_t src0_bytes = static_cast<uint64_t>(ggml_nbytes(src0));
     const uint64_t src1_bytes = static_cast<uint64_t>(ggml_nbytes(src1));
     const uint64_t dst_bytes  = static_cast<uint64_t>(ggml_nbytes(node));
-    if (!mulmm_addressable(s0r.offset_bytes, src0_bytes) ||
-        !mulmm_addressable(s1r.offset_bytes, src1_bytes) ||
-        !mulmm_addressable(dr.offset_bytes,  dst_bytes)) {
+    // With sliding-window UAVs the relevant range is "tensor extent" (not
+    // "parent buffer extent"), which only has to fit in 4 GB (uint shader
+    // address). Real LLM weights are well under that; this is just a safety
+    // guard.
+    if (src0_bytes > (uint64_t{1} << 32) ||
+        src1_bytes > (uint64_t{1} << 32) ||
+        dst_bytes  > (uint64_t{1} << 32)) {
         return true;
     }
     if (s0r.offset_bytes > s0r.buffer_size_bytes || s1r.offset_bytes > s1r.buffer_size_bytes || dr.offset_bytes > dr.buffer_size_bytes) return true;
@@ -152,22 +158,15 @@ inline bool dispatch_mulmm(dispatch_ctx & ctx, const ggml_tensor * node) {
         return true;
     }
 
-    const size_t src0_es = ggml_type_size(src0->type);
-    // Q8_0 nb[2]/nb[3] are byte offsets to the next batch slice which need not
-    // be multiples of the 34-byte block size (e.g. row 1 of a ne[1]=3584
-    // matrix lands 3808 bytes in, but the next slice lands at 3808*3584 ==
-    // 13_651_712 bytes, which is not divisible by 34). The shader only
-    // dereferences nb[2]/nb[3] when the corresponding batch dim is actually
-    // broadcast/non-singleton, so guard the stride alignment on a per-axis
-    // basis using the broadcast factors we already computed for src1->ne.
-    if ((s0r.offset_bytes % src0_es) != 0) return true;
-    if (src0->ne[2] > 1 && (src0->nb[2] % src0_es) != 0) return true;
-    if (src0->ne[3] > 1 && (src0->nb[3] % src0_es) != 0) return true;
-    if ((s1r.offset_bytes % sizeof(float)) != 0 || (dr.offset_bytes % sizeof(float)) != 0) return true;
+    // Alignment of nb[2]/nb[3] (used by the shader for batch indexing within
+    // the sliding UAV window). F32 needs 4-byte; F16 and Q8_0 need 2-byte
+    // because their loads go through load_u8.
+    const size_t src0_off_align = (src0->type == GGML_TYPE_F32) ? 4u : 2u;
+    if (src0->ne[2] > 1 && (src0->nb[2] % src0_off_align) != 0) return true;
+    if (src0->ne[3] > 1 && (src0->nb[3] % src0_off_align) != 0) return true;
 
     const uint64_t dims_and_strides[] = {
         M, N, K, batch_ne2, broadcast2, broadcast3,
-        static_cast<uint64_t>(s0r.offset_bytes), static_cast<uint64_t>(s1r.offset_bytes), static_cast<uint64_t>(dr.offset_bytes),
         static_cast<uint64_t>(src0->nb[1]), static_cast<uint64_t>(src0->nb[2]), static_cast<uint64_t>(src0->nb[3]),
     };
     for (uint64_t v : dims_and_strides) {
@@ -180,7 +179,10 @@ inline bool dispatch_mulmm(dispatch_ctx & ctx, const ggml_tensor * node) {
 
     D3D12_GPU_DESCRIPTOR_HANDLE uav_table = {};
     const ggml_tensor * uavs[3] = { src0, src1, node };
-    if (!ctx_bind_raw_uavs(ctx, uavs, 3, &uav_table)) return true;
+    uint32_t shader_offsets[3] = { 0, 0, 0 };
+    if (!ctx_bind_raw_uavs_sliding(ctx, uavs, 3, &uav_table, shader_offsets)) return true;
+    if ((shader_offsets[0] % src0_off_align) != 0) return true;
+    if ((shader_offsets[1] % sizeof(float)) != 0 || (shader_offsets[2] % sizeof(float)) != 0) return true;
 
     ID3D12RootSignature * rs = ctx_get_root_sig(ctx, 3, 12);
     if (rs == nullptr) return true;
@@ -194,9 +196,9 @@ inline bool dispatch_mulmm(dispatch_ctx & ctx, const ggml_tensor * node) {
         static_cast<UINT>(batch_ne2),
         static_cast<UINT>(broadcast2),
         static_cast<UINT>(broadcast3),
-        static_cast<UINT>(s0r.offset_bytes),
-        static_cast<UINT>(s1r.offset_bytes),
-        static_cast<UINT>(dr.offset_bytes),
+        shader_offsets[0],
+        shader_offsets[1],
+        shader_offsets[2],
         static_cast<UINT>(src0->nb[1]),
         static_cast<UINT>(src0->nb[2]),
         static_cast<UINT>(src0->nb[3]),
