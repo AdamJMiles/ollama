@@ -21,10 +21,19 @@ inline bool supports_op_memops(const ggml_tensor * op) {
         case GGML_OP_DUP: {
             const ggml_tensor * src = op->src[0];
             if (src == nullptr) return false;
-            if (src->type != GGML_TYPE_F32 || op->type != GGML_TYPE_F32) return false;
             if (!ggml_is_contiguous(src) || !ggml_is_contiguous(op)) return false;
             if (ggml_nelements(op) != ggml_nelements(src)) return false;
-            return true;
+            // Same-type byte copy (F32->F32 covers the original case but also
+            // F16->F16, Q8_0->Q8_0, etc. since this is just a bulk byte copy
+            // for contiguous tensors of identical layout).
+            if (src->type == op->type) {
+                return ggml_nbytes(src) == ggml_nbytes(op);
+            }
+            // F32 -> F16 conversion (KV cache writes during decode).
+            if (src->type == GGML_TYPE_F32 && op->type == GGML_TYPE_F16) {
+                return true;
+            }
+            return false;
         }
         case GGML_OP_SET_ROWS: {
             if (std::getenv("GGML_D3D12_DISABLE_SET_ROWS") != nullptr) return false;
@@ -71,6 +80,48 @@ static bool dispatch_cpy_dup(dispatch_ctx & ctx, const ggml_tensor * node) {
     const tensor_resource dst_r = ctx_resolve_tensor(ctx, node);
     if (!src_r.valid || !dst_r.valid) return true; // claimed but failed
 
+    if (src->type == GGML_TYPE_F32 && node->type == GGML_TYPE_F16) {
+        // F32 -> F16 conversion. Each thread emits one 32-bit store covering
+        // two F16 dst elements; a trailing odd element RMWs the half-uint.
+        const uint64_t elem_count = static_cast<uint64_t>(ggml_nelements(node));
+        if (elem_count == 0) return true;
+        if (elem_count > 0xFFFFFFFFull) return true;
+
+        const uint64_t src_bytes = elem_count * sizeof(float);
+        const uint64_t dst_bytes = ((elem_count + 1ull) / 2ull) * 4ull;
+        if (src_bytes > 0xFFFFFFFFull || dst_bytes > 0xFFFFFFFFull) return true;
+        if ((src_r.offset_bytes % 4) != 0 || (dst_r.offset_bytes % 4) != 0) return true;
+        if (src_r.offset_bytes > 0xFFFFFFFFull - src_bytes) return true;
+        if (dst_r.offset_bytes > 0xFFFFFFFFull - dst_bytes) return true;
+
+        if (!ctx_transition(ctx, src, D3D12_RESOURCE_STATE_UNORDERED_ACCESS)) return true;
+        if (!ctx_transition(ctx, node, D3D12_RESOURCE_STATE_UNORDERED_ACCESS)) return true;
+
+        D3D12_GPU_DESCRIPTOR_HANDLE uav_table = {};
+        const ggml_tensor * uavs[2] = { src, node };
+        if (!ctx_bind_raw_uavs(ctx, uavs, 2, &uav_table)) return true;
+
+        ID3D12RootSignature * root_sig = ctx_get_root_sig(ctx, 2, 4);
+        if (root_sig == nullptr) return true;
+
+        ID3D12PipelineState * pso = ctx.psos->get("cpy_f32_to_f16_fp16", root_sig, {});
+        if (pso == nullptr) return true;
+
+        const UINT consts[4] = {
+            static_cast<UINT>(elem_count),
+            static_cast<UINT>(src_r.offset_bytes),
+            static_cast<UINT>(dst_r.offset_bytes),
+            0,
+        };
+        if (!ctx_bind_compute(ctx, pso, root_sig, uav_table, 2, consts, 4)) return true;
+
+        const UINT threads = static_cast<UINT>((elem_count + 1ull) / 2ull);
+        ctx_dispatch_1d(ctx, threads, 256);
+        ctx_uav_barrier(ctx, node);
+        return true;
+    }
+
+    // Same-type byte copy.
     const size_t bytes = ggml_nbytes(src);
     if (bytes == 0) return true; // trivial no-op
     if ((bytes % 4) != 0) return true;

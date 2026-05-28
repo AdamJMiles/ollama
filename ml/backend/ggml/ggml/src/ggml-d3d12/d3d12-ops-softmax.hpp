@@ -35,9 +35,14 @@ inline bool supports_op_softmax(const ggml_tensor * op) {
     if (mask != nullptr) {
         if (mask->type != GGML_TYPE_F32) return false;
         if (!ggml_is_contiguous(mask)) return false;
-        for (int i = 0; i < GGML_MAX_DIMS; ++i) {
-            if (mask->ne[i] != op->src[0]->ne[i]) return false;
-        }
+        // mask must match src in dims 0/1; dims 2/3 may broadcast (typically
+        // mask_ne2 == 1 to share an attn mask across all heads).
+        const ggml_tensor * src = op->src[0];
+        if (mask->ne[0] != src->ne[0]) return false;
+        if (mask->ne[1] != src->ne[1]) return false;
+        if (mask->ne[2] == 0 || mask->ne[3] == 0) return false;
+        if (src->ne[2] % mask->ne[2] != 0) return false;
+        if (src->ne[3] % mask->ne[3] != 0) return false;
     }
     return true;
 }
@@ -94,7 +99,7 @@ inline bool dispatch_softmax(dispatch_ctx & ctx, const ggml_tensor * node) {
     const ggml_tensor * uavs[3] = { src, mask_for_bind, node };
     if (!ctx_bind_raw_uavs(ctx, uavs, 3, &uav_table)) return true;
 
-    ID3D12RootSignature * root_sig = ctx_get_root_sig(ctx, 3, 8);
+    ID3D12RootSignature * root_sig = ctx_get_root_sig(ctx, 3, 12);
     if (root_sig == nullptr) return true;
 
     const char * shader = softmax_wave_enabled(ctx) ? "soft_max_f32_wave" : "soft_max_f32";
@@ -104,17 +109,22 @@ inline bool dispatch_softmax(dispatch_ctx & ctx, const ggml_tensor * node) {
     UINT scale_bits = 0;
     std::memcpy(&scale_bits, &scale, sizeof(scale_bits));
 
-    const UINT consts[8] = {
+    const ggml_tensor * mask_for_dims = mask != nullptr ? mask : src;
+    const UINT consts[12] = {
         static_cast<UINT>(ne0),
         static_cast<UINT>(src->ne[1]),
+        static_cast<UINT>(src->ne[2]),
+        static_cast<UINT>(mask_for_dims->ne[2]),
+        static_cast<UINT>(mask_for_dims->ne[3]),
         static_cast<UINT>(sr.offset_bytes),
         static_cast<UINT>(dr.offset_bytes),
         static_cast<UINT>(mask != nullptr ? mr.offset_bytes : 0),
         static_cast<UINT>(mask != nullptr ? row_bytes : 0),
         scale_bits,
         mask != nullptr ? 1u : 0u,
+        0,
     };
-    if (!ctx_bind_compute(ctx, pso, root_sig, uav_table, 3, consts, 8)) return true;
+    if (!ctx_bind_compute(ctx, pso, root_sig, uav_table, 3, consts, 12)) return true;
 
     ctx_dispatch_groups(ctx, static_cast<UINT>(n_rows), 1, 1);
     ctx_uav_barrier(ctx, node);

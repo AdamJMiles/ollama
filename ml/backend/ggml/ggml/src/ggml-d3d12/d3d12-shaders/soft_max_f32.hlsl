@@ -7,12 +7,16 @@ RWByteAddressBuffer dst_buf  : register(u2);
 cbuffer Params : register(b0) {
     uint ne0;
     uint ne1;
+    uint src_ne2;
+    uint mask_ne2;
+    uint mask_ne3;
     uint src_off;
     uint dst_off;
     uint mask_off;
     uint mask_stride_row;
     uint scale_bits;
     uint flags;
+    uint _pad;
 };
 
 groupshared float reduce_max[TG_SIZE];
@@ -27,7 +31,15 @@ void main(uint3 gtid : SV_GroupThreadID, uint3 gid : SV_GroupID) {
 
     const uint row_off_in = src_off + row * ne0 * 4u;
     const uint row_off_out = dst_off + row * ne0 * 4u;
-    const uint row_off_mask = mask_off + row * mask_stride_row;
+
+    const uint i01 = (ne1 == 0u) ? 0u : (row % ne1);
+    const uint t02 = (ne1 == 0u) ? 0u : (row / ne1);
+    const uint i02 = (src_ne2 == 0u) ? 0u : (t02 % src_ne2);
+    const uint i03 = (src_ne2 == 0u) ? 0u : (t02 / src_ne2);
+    const uint mi02 = (mask_ne2 == 0u) ? 0u : (i02 % mask_ne2);
+    const uint mi03 = (mask_ne3 == 0u) ? 0u : (i03 % mask_ne3);
+    const uint mask_row = i01 + mi02 * ne1 + mi03 * ne1 * mask_ne2;
+    const uint row_off_mask = mask_off + mask_row * mask_stride_row;
 
     float local_max = -3.402823466e+38f;
     for (uint i = tid; i < ne0; i += TG_SIZE) {
