@@ -11,6 +11,8 @@ cbuffer Params : register(b0) {
     uint N;
     uint K;
     uint batch_ne2;
+    uint broadcast2;
+    uint broadcast3;
     uint src0_off;
     uint src1_off;
     uint dst_off;
@@ -29,7 +31,9 @@ void main(uint3 gid : SV_GroupID, uint3 gtid : SV_GroupThreadID) {
     const uint batch = gid.z;
     const uint b2 = batch % batch_ne2;
     const uint b3 = batch / batch_ne2;
-    const uint src0_base = src0_off + b2 * src0_nb2 + b3 * src0_nb3;
+    const uint s0b2 = (broadcast2 == 0u) ? b2 : (b2 / broadcast2);
+    const uint s0b3 = (broadcast3 == 0u) ? b3 : (b3 / broadcast3);
+    const uint src0_base = src0_off + s0b2 * src0_nb2 + s0b3 * src0_nb3;
     const uint src1_base = src1_off + batch * N * K * 4u;
     const uint dst_base = dst_off + batch * N * M * 4u;
     const uint tid = gtid.y * TN + gtid.x;

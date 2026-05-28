@@ -59,7 +59,19 @@ inline bool supports_op_mulmm(const ggml_tensor * op) {
     if (src0->ne[0] != src1->ne[0]) return false;
     if (op->ne[0] != src0->ne[1] || op->ne[1] != src1->ne[1]) return false;
     if (op->ne[2] != src1->ne[2] || op->ne[3] != src1->ne[3]) return false;
-    if (src0->ne[2] != src1->ne[2] || src0->ne[3] != src1->ne[3]) return false;
+    // GQA / broadcast: each src0 head shared by N = src1_ne / src0_ne
+    // consecutive src1 heads (floor-div), matching ggml mul_mat broadcast.
+    if (src0->ne[2] == 0 || src0->ne[3] == 0) return false;
+    if (src1->ne[2] % src0->ne[2] != 0) return false;
+    if (src1->ne[3] % src0->ne[3] != 0) return false;
+    // GQA mul_mm is currently slower than the CPU fallback for the very
+    // large attention shapes that Qwen-style models hit during decode (no
+    // flash attention path yet); leave it opt-in until either the kernel is
+    // tuned or FLASH_ATTN_EXT is implemented.
+    if ((src1->ne[2] != src0->ne[2] || src1->ne[3] != src0->ne[3]) &&
+        std::getenv("GGML_D3D12_ENABLE_MULMM_GQA") == nullptr) {
+        return false;
+    }
 
     if (!ggml_is_contiguous(src1) || !ggml_is_contiguous(op)) return false;
     if (!ggml_is_contiguous(src0) && !mulmm_row_contiguous(src0)) return false;
@@ -84,6 +96,8 @@ inline bool dispatch_mulmm(dispatch_ctx & ctx, const ggml_tensor * node) {
     const uint64_t K = static_cast<uint64_t>(src0->ne[0]);
     const uint64_t batch_ne2 = static_cast<uint64_t>(src1->ne[2]);
     const uint64_t batch = batch_ne2 * static_cast<uint64_t>(src1->ne[3]);
+    const uint64_t broadcast2 = static_cast<uint64_t>(src1->ne[2]) / static_cast<uint64_t>(src0->ne[2]);
+    const uint64_t broadcast3 = static_cast<uint64_t>(src1->ne[3]) / static_cast<uint64_t>(src0->ne[3]);
     const uint64_t gx = (N + 31u) / 32u;
     const uint64_t gy = (M + 31u) / 32u;
     const uint64_t gz = batch;
@@ -114,7 +128,7 @@ inline bool dispatch_mulmm(dispatch_ctx & ctx, const ggml_tensor * node) {
     if ((s1r.offset_bytes % sizeof(float)) != 0 || (dr.offset_bytes % sizeof(float)) != 0) return true;
 
     const uint64_t dims_and_strides[] = {
-        M, N, K, batch_ne2,
+        M, N, K, batch_ne2, broadcast2, broadcast3,
         static_cast<uint64_t>(s0r.offset_bytes), static_cast<uint64_t>(s1r.offset_bytes), static_cast<uint64_t>(dr.offset_bytes),
         static_cast<uint64_t>(src0->nb[1]), static_cast<uint64_t>(src0->nb[2]), static_cast<uint64_t>(src0->nb[3]),
     };
@@ -130,16 +144,18 @@ inline bool dispatch_mulmm(dispatch_ctx & ctx, const ggml_tensor * node) {
     const ggml_tensor * uavs[3] = { src0, src1, node };
     if (!ctx_bind_raw_uavs(ctx, uavs, 3, &uav_table)) return true;
 
-    ID3D12RootSignature * rs = ctx_get_root_sig(ctx, 3, 10);
+    ID3D12RootSignature * rs = ctx_get_root_sig(ctx, 3, 12);
     if (rs == nullptr) return true;
     ID3D12PipelineState * pso = ctx.psos->get(shader, rs, {});
     if (pso == nullptr) return true;
 
-    const UINT consts[10] = {
+    const UINT consts[12] = {
         static_cast<UINT>(M),
         static_cast<UINT>(N),
         static_cast<UINT>(K),
         static_cast<UINT>(batch_ne2),
+        static_cast<UINT>(broadcast2),
+        static_cast<UINT>(broadcast3),
         static_cast<UINT>(s0r.offset_bytes),
         static_cast<UINT>(s1r.offset_bytes),
         static_cast<UINT>(dr.offset_bytes),
@@ -147,7 +163,7 @@ inline bool dispatch_mulmm(dispatch_ctx & ctx, const ggml_tensor * node) {
         static_cast<UINT>(src0->nb[2]),
         static_cast<UINT>(src0->nb[3]),
     };
-    if (!ctx_bind_compute(ctx, pso, rs, uav_table, 3, consts, 10)) return true;
+    if (!ctx_bind_compute(ctx, pso, rs, uav_table, 3, consts, 12)) return true;
 
     ctx_dispatch_groups(ctx, static_cast<UINT>(gx), static_cast<UINT>(gy), static_cast<UINT>(gz));
     ctx_uav_barrier(ctx, node);
