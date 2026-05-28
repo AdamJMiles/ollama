@@ -24,8 +24,12 @@ inline bool supports_op_reductions(const ggml_tensor * op) {
     switch (op->op) {
         case GGML_OP_NORM:
         case GGML_OP_RMS_NORM:
-        case GGML_OP_L2_NORM:
             return reductions_same_shape_f32(op);
+        case GGML_OP_L2_NORM: {
+            float eps = 0.0f;
+            std::memcpy(&eps, op->op_params, sizeof(float));
+            return reductions_same_shape_f32(op) && eps <= 1e-4f;
+        }
         case GGML_OP_GROUP_NORM: {
             const int n_groups = op->op_params[0];
             return reductions_same_shape_f32(op) && n_groups > 0 && n_groups <= src->ne[2];

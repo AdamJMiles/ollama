@@ -36,8 +36,7 @@ inline bool supports_im2col_2d_f32_src(const ggml_tensor * op) {
     const ggml_tensor * src = op->src[1];
     if (!conv_shape_positive(kernel) || !conv_shape_positive(src) || !conv_shape_positive(op)) return false;
     if (src->type != GGML_TYPE_F32) return false;
-    if (op->type != GGML_TYPE_F32 && op->type != GGML_TYPE_F16) return false;
-    if (op->type == GGML_TYPE_F16 && kernel->type != GGML_TYPE_F16) return false;
+    if (op->type != GGML_TYPE_F32) return false;
     if (!ggml_is_contiguous(src) || !ggml_is_contiguous(op)) return false;
 
     if (kernel->ne[2] != src->ne[2]) return false;
