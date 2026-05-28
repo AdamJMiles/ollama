@@ -1,12 +1,23 @@
 #pragma once
 
 #include <cstdint>
+#include <cstdlib>
 #include <cstring>
 #include <limits>
 
 #include "d3d12-ops-common.hpp"
 
 namespace ggml_d3d12 {
+
+inline bool softmax_wave_enabled(dispatch_ctx & ctx) {
+    if (std::getenv("GGML_D3D12_DISABLE_WAVE") != nullptr || ctx.device == nullptr) return false;
+
+    D3D12_FEATURE_DATA_D3D12_OPTIONS1 opts = {};
+    if (FAILED(ctx.device->CheckFeatureSupport(D3D12_FEATURE_D3D12_OPTIONS1, &opts, sizeof(opts)))) {
+        return false;
+    }
+    return opts.WaveOps != FALSE;
+}
 
 inline bool supports_op_softmax(const ggml_tensor * op) {
     if (op == nullptr || op->src[0] == nullptr) return false;
@@ -86,7 +97,8 @@ inline bool dispatch_softmax(dispatch_ctx & ctx, const ggml_tensor * node) {
     ID3D12RootSignature * root_sig = ctx_get_root_sig(ctx, 3, 8);
     if (root_sig == nullptr) return true;
 
-    ID3D12PipelineState * pso = ctx.psos->get("soft_max_f32", root_sig, {});
+    const char * shader = softmax_wave_enabled(ctx) ? "soft_max_f32_wave" : "soft_max_f32";
+    ID3D12PipelineState * pso = ctx.psos->get(shader, root_sig, {});
     if (pso == nullptr) return true;
 
     UINT scale_bits = 0;

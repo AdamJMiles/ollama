@@ -1,11 +1,36 @@
 #pragma once
 
 #include <cstdint>
+#include <cstdlib>
 #include <limits>
 
 #include "d3d12-ops-common.hpp"
 
 namespace ggml_d3d12 {
+
+inline bool mulmatvec_wave_enabled(dispatch_ctx & ctx) {
+    if (std::getenv("GGML_D3D12_DISABLE_WAVE") != nullptr || ctx.device == nullptr) return false;
+
+    D3D12_FEATURE_DATA_D3D12_OPTIONS1 opts = {};
+    if (FAILED(ctx.device->CheckFeatureSupport(D3D12_FEATURE_D3D12_OPTIONS1, &opts, sizeof(opts)))) {
+        return false;
+    }
+    return opts.WaveOps != FALSE;
+}
+
+inline bool mulmatvec_fp16_enabled(ID3D12Device * device) {
+    if (std::getenv("GGML_D3D12_DISABLE_FP16") != nullptr || device == nullptr) {
+        return false;
+    }
+
+    D3D12_FEATURE_DATA_SHADER_MODEL sm = { D3D_SHADER_MODEL_6_8 };
+    if (FAILED(device->CheckFeatureSupport(D3D12_FEATURE_SHADER_MODEL, &sm, sizeof(sm))) || sm.HighestShaderModel < D3D_SHADER_MODEL_6_2) {
+        return false;
+    }
+
+    D3D12_FEATURE_DATA_D3D12_OPTIONS4 opt4 = {};
+    return SUCCEEDED(device->CheckFeatureSupport(D3D12_FEATURE_D3D12_OPTIONS4, &opt4, sizeof(opt4))) && opt4.Native16BitShaderOpsSupported != FALSE;
+}
 
 inline bool mulmatvec_supported_src0_type(ggml_type type) {
     switch (type) {
@@ -19,13 +44,30 @@ inline bool mulmatvec_supported_src0_type(ggml_type type) {
     }
 }
 
-inline const char * mulmatvec_shader_name(ggml_type type) {
+inline bool mulmatvec_dp4a_disabled() {
+    return std::getenv("GGML_D3D12_DISABLE_DP4A") != nullptr;
+}
+
+inline bool mulmatvec_dp4a_enabled(dispatch_ctx & ctx, bool dp4a_disabled) {
+    if (dp4a_disabled || ctx.device == nullptr) return false;
+
+    D3D12_FEATURE_DATA_SHADER_MODEL sm = { D3D_SHADER_MODEL_6_4 };
+    return SUCCEEDED(ctx.device->CheckFeatureSupport(D3D12_FEATURE_SHADER_MODEL, &sm, sizeof(sm))) &&
+           sm.HighestShaderModel >= D3D_SHADER_MODEL_6_4;
+}
+
+inline const char * mulmatvec_shader_name(ggml_type type, bool native_fp16, bool use_wave, bool use_dp4a) {
     switch (type) {
-        case GGML_TYPE_F32:  return "mul_mat_vec_f32_f32";
-        case GGML_TYPE_F16:  return "mul_mat_vec_f16_f32";
-        case GGML_TYPE_Q4_0: return "mul_mat_vec_q4_0_f32";
-        case GGML_TYPE_Q8_0: return "mul_mat_vec_q8_0_f32";
-        default: return nullptr;
+        case GGML_TYPE_F32:
+            return use_wave ? "mul_mat_vec_f32_f32_wave" : "mul_mat_vec_f32_f32";
+        case GGML_TYPE_F16:
+            return native_fp16 ? "mul_mat_vec_f16_f32_fp16" : (use_wave ? "mul_mat_vec_f16_f32_wave" : "mul_mat_vec_f16_f32");
+        case GGML_TYPE_Q4_0:
+            return use_wave ? "mul_mat_vec_q4_0_f32_wave" : (use_dp4a ? "mul_mat_vec_q4_0_dp4a_f32" : "mul_mat_vec_q4_0_f32");
+        case GGML_TYPE_Q8_0:
+            return use_wave ? "mul_mat_vec_q8_0_f32_wave" : (use_dp4a ? "mul_mat_vec_q8_0_dp4a_f32" : "mul_mat_vec_q8_0_f32");
+        default:
+            return nullptr;
     }
 }
 
@@ -70,7 +112,11 @@ inline bool dispatch_mulmatvec(dispatch_ctx & ctx, const ggml_tensor * node) {
 
     const ggml_tensor * src0 = node->src[0];
     const ggml_tensor * src1 = node->src[1];
-    const char * shader = mulmatvec_shader_name(src0->type);
+    const bool dp4a_disabled = mulmatvec_dp4a_disabled();
+    const char * shader = mulmatvec_shader_name(src0->type,
+                                                mulmatvec_fp16_enabled(ctx.device),
+                                                mulmatvec_wave_enabled(ctx),
+                                                mulmatvec_dp4a_enabled(ctx, dp4a_disabled));
     if (shader == nullptr) return true;
 
     const tensor_resource w_res = ctx_resolve_tensor(ctx, src0);

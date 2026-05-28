@@ -287,6 +287,44 @@ bool has_hlsl_extension(const fs::path & path) {
     return to_lower_ascii(path.extension().string()) == ".hlsl";
 }
 
+bool uses_native_fp16_types(const shader_source & source) {
+    const std::string filename = to_lower_ascii(source.path.filename().string());
+    const std::string suffix = "_fp16.hlsl";
+    return filename.size() >= suffix.size() && filename.compare(filename.size() - suffix.size(), suffix.size(), suffix) == 0;
+}
+
+bool parse_compute_target(const std::string & target, int & major, int & minor) {
+    if (target.size() < 6 || target[0] != 'c' || target[1] != 's' || target[2] != '_') {
+        return false;
+    }
+    const std::size_t sep = target.find('_', 3);
+    if (sep == std::string::npos || sep == 3 || sep + 1 >= target.size()) {
+        return false;
+    }
+    for (std::size_t i = 3; i < sep; ++i) {
+        if (std::isdigit(static_cast<unsigned char>(target[i])) == 0) return false;
+    }
+    for (std::size_t i = sep + 1; i < target.size(); ++i) {
+        if (std::isdigit(static_cast<unsigned char>(target[i])) == 0) return false;
+    }
+    major = std::stoi(target.substr(3, sep - 3));
+    minor = std::stoi(target.substr(sep + 1));
+    return true;
+}
+
+std::string target_for_source(const shader_source & source, const options & opts) {
+    if (!uses_native_fp16_types(source)) {
+        return opts.target;
+    }
+
+    int major = 0;
+    int minor = 0;
+    if (parse_compute_target(opts.target, major, minor) && (major < 6 || (major == 6 && minor < 2))) {
+        return "cs_6_2";
+    }
+    return opts.target;
+}
+
 std::string logical_name_from_relative_path(fs::path relative_path) {
     relative_path.replace_extension();
     const std::string raw = relative_path.generic_string();
@@ -507,11 +545,15 @@ compiled_shader compile_shader(
     fs::remove(dxil_path, ignored_ec);
 
     try {
+        const bool native_fp16 = uses_native_fp16_types(source);
         std::string command_line = quote_arg(opts.dxc.string());
-        command_line += " -T " + quote_arg(opts.target);
+        command_line += " -T " + quote_arg(target_for_source(source, opts));
         command_line += " -E main";
         command_line += " -Fo " + quote_arg(dxil_path.string());
         command_line += " -nologo";
+        if (native_fp16) {
+            command_line += " -enable-16bit-types";
+        }
         command_line += opts.debug ? " -Zi -Qembed_debug -Od" : " -O3";
         command_line += " " + quote_arg(source.path.string());
 

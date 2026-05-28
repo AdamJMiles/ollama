@@ -2,10 +2,21 @@
 
 #include <cstring>
 #include <cstdint>
+#include <cstdlib>
 
 #include "d3d12-ops-common.hpp"
 
 namespace ggml_d3d12 {
+
+inline bool reductions_wave_enabled(dispatch_ctx & ctx) {
+    if (std::getenv("GGML_D3D12_DISABLE_WAVE") != nullptr || ctx.device == nullptr) return false;
+
+    D3D12_FEATURE_DATA_D3D12_OPTIONS1 opts = {};
+    if (FAILED(ctx.device->CheckFeatureSupport(D3D12_FEATURE_D3D12_OPTIONS1, &opts, sizeof(opts)))) {
+        return false;
+    }
+    return opts.WaveOps != FALSE;
+}
 
 inline bool reductions_same_shape_f32(const ggml_tensor * op) {
     return op->type == GGML_TYPE_F32 && ggml_are_same_shape(op, op->src[0]);
@@ -58,6 +69,7 @@ inline bool dispatch_reductions(dispatch_ctx & ctx, const ggml_tensor * node) {
     const uint64_t total = static_cast<uint64_t>(ggml_nelements(src));
     if (total == 0) return true;
 
+    const bool use_wave = reductions_wave_enabled(ctx);
     const char * shader = nullptr;
     UINT param0 = 0;
     uint64_t param1_u64 = 0;
@@ -67,19 +79,19 @@ inline bool dispatch_reductions(dispatch_ctx & ctx, const ggml_tensor * node) {
 
     switch (node->op) {
         case GGML_OP_NORM:
-            shader = "norm_f32";
+            shader = use_wave ? "norm_f32_wave" : "norm_f32";
             std::memcpy(&param0, node->op_params, sizeof(float));
             break;
         case GGML_OP_RMS_NORM:
-            shader = "rms_norm_f32";
+            shader = use_wave ? "rms_norm_f32_wave" : "rms_norm_f32";
             std::memcpy(&param0, node->op_params, sizeof(float));
             break;
         case GGML_OP_L2_NORM:
-            shader = "l2_norm_f32";
+            shader = use_wave ? "l2_norm_f32_wave" : "l2_norm_f32";
             std::memcpy(&param0, node->op_params, sizeof(float));
             break;
         case GGML_OP_GROUP_NORM: {
-            shader = "group_norm_f32";
+            shader = use_wave ? "group_norm_f32_wave" : "group_norm_f32";
             const int n_groups = node->op_params[0];
             float eps = 0.0f;
             std::memcpy(&eps, node->op_params + 1, sizeof(float));
@@ -95,18 +107,18 @@ inline bool dispatch_reductions(dispatch_ctx & ctx, const ggml_tensor * node) {
             break;
         }
         case GGML_OP_SUM:
-            shader = "sum_f32";
+            shader = use_wave ? "sum_f32_wave" : "sum_f32";
             reduction_width = total;
             dispatch_x = 1;
             break;
         case GGML_OP_SUM_ROWS:
-            shader = "sum_rows_f32";
+            shader = use_wave ? "sum_rows_f32_wave" : "sum_rows_f32";
             break;
         case GGML_OP_MEAN:
-            shader = "mean_f32";
+            shader = use_wave ? "mean_f32_wave" : "mean_f32";
             break;
         case GGML_OP_ARGMAX:
-            shader = "argmax_f32";
+            shader = use_wave ? "argmax_f32_wave" : "argmax_f32";
             break;
         default:
             return true;

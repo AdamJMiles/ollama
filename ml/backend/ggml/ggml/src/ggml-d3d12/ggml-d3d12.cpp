@@ -352,6 +352,29 @@ static void d3d12_log_hr(const char * what, HRESULT hr) {
     GGML_LOG_ERROR("ggml_d3d12: %s failed with HRESULT 0x%08x\n", what, static_cast<unsigned>(hr));
 }
 
+static bool d3d12_check_budget(d3d12_device * dev, UINT64 requested_bytes) {
+    if (std::getenv("GGML_D3D12_NO_BUDGET_GUARD")) {
+        return true;
+    }
+
+    DXGI_QUERY_VIDEO_MEMORY_INFO info = {};
+    HRESULT hr = dev->adapter->QueryVideoMemoryInfo(0, DXGI_MEMORY_SEGMENT_GROUP_LOCAL, &info);
+    if (FAILED(hr)) {
+        return true;
+    }
+
+    const UINT64 available = info.Budget > info.CurrentUsage ? info.Budget - info.CurrentUsage : 0;
+    if (requested_bytes > available) {
+        GGML_LOG_WARN("ggml_d3d12: %s alloc of %.2f MiB would exceed budget (usage %.2f MiB / budget %.2f MiB)\n",
+                      dev->name.c_str(),
+                      double(requested_bytes) / (1024.0 * 1024.0),
+                      double(info.CurrentUsage) / (1024.0 * 1024.0),
+                      double(info.Budget) / (1024.0 * 1024.0));
+        return false;
+    }
+    return true;
+}
+
 static void d3d12_setup_buffer_type(d3d12_device * dev) {
     dev->buffer_type_context.dev = dev;
     dev->buffer_type = ggml_backend_buffer_type {
@@ -527,14 +550,31 @@ static bool d3d12_device_ensure(d3d12_device * dev) {
         }
         dev->caps.dedicated_video_memory = dev->desc.DedicatedVideoMemory;
         dev->caps.shared_system_memory   = dev->desc.SharedSystemMemory;
-        GGML_LOG_INFO("ggml_d3d12: %s caps: SM=6_%u wave_ops=%d lanes=[%u..%u] native_16bit=%d vram=%.1fGiB\n",
-                      dev->name.c_str(),
-                      static_cast<unsigned>(dev->caps.shader_model & 0xF),
-                      dev->caps.wave_ops ? 1 : 0,
-                      dev->caps.wave_lane_count_min,
-                      dev->caps.wave_lane_count_max,
-                      dev->caps.native_16bit ? 1 : 0,
-                      double(dev->caps.dedicated_video_memory) / double(1ull << 30));
+
+        DXGI_QUERY_VIDEO_MEMORY_INFO memory_info = {};
+        const HRESULT memory_hr = dev->adapter->QueryVideoMemoryInfo(0, DXGI_MEMORY_SEGMENT_GROUP_LOCAL, &memory_info);
+        if (SUCCEEDED(memory_hr)) {
+            GGML_LOG_INFO("ggml_d3d12: %s caps: SM=6_%u wave_ops=%d lanes=[%u..%u] native_16bit=%d vram=%.1fGiB budget=%.1fGiB usage=%.1fGiB\n",
+                          dev->name.c_str(),
+                          static_cast<unsigned>(dev->caps.shader_model & 0xF),
+                          dev->caps.wave_ops ? 1 : 0,
+                          dev->caps.wave_lane_count_min,
+                          dev->caps.wave_lane_count_max,
+                          dev->caps.native_16bit ? 1 : 0,
+                          double(dev->caps.dedicated_video_memory) / double(1ull << 30),
+                          double(memory_info.Budget) / double(1ull << 30),
+                          double(memory_info.CurrentUsage) / double(1ull << 30));
+        } else {
+            GGML_LOG_INFO("ggml_d3d12: %s caps: SM=6_%u wave_ops=%d lanes=[%u..%u] native_16bit=%d vram=%.1fGiB budget=query-failed HRESULT=0x%08x\n",
+                          dev->name.c_str(),
+                          static_cast<unsigned>(dev->caps.shader_model & 0xF),
+                          dev->caps.wave_ops ? 1 : 0,
+                          dev->caps.wave_lane_count_min,
+                          dev->caps.wave_lane_count_max,
+                          dev->caps.native_16bit ? 1 : 0,
+                          double(dev->caps.dedicated_video_memory) / double(1ull << 30),
+                          static_cast<unsigned>(memory_hr));
+        }
     }
 
     D3D12_COMMAND_QUEUE_DESC queue_desc = {};
@@ -812,6 +852,10 @@ static ggml_backend_buffer_t ggml_backend_d3d12_buffer_type_alloc_buffer(ggml_ba
 
     D3D12_HEAP_PROPERTIES heap_props = d3d12_heap_properties(D3D12_HEAP_TYPE_DEFAULT);
     D3D12_RESOURCE_DESC desc = d3d12_buffer_desc(size, D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS);
+    if (!d3d12_check_budget(dev, desc.Width)) {
+        delete buffer_ctx;
+        return nullptr;
+    }
     HRESULT hr = dev->device->CreateCommittedResource(
         &heap_props, D3D12_HEAP_FLAG_NONE, &desc, D3D12_RESOURCE_STATE_COMMON, nullptr, IID_PPV_ARGS(&buffer_ctx->resource));
     if (FAILED(hr)) {
@@ -984,21 +1028,40 @@ static bool ggml_backend_d3d12_buffer_cpy_tensor(ggml_backend_buffer_t buffer, c
     }
 
     ggml_backend_buffer_t src_buffer = d3d12_tensor_buffer(src);
-    if (src_buffer == nullptr || src_buffer->buft->iface.get_name != ggml_backend_d3d12_buffer_type_get_name) {
+    if (src_buffer == nullptr || src_buffer->buft == nullptr || src_buffer->buft->iface.get_name != ggml_backend_d3d12_buffer_type_get_name) {
         return false;
     }
 
     d3d12_buffer * src_ctx = static_cast<d3d12_buffer *>(src_buffer->context);
-    if (src_ctx->host || src_ctx->dev != dst_ctx->dev) {
+    if (src_ctx == nullptr || src_ctx->host) {
         return false;
     }
+
+    const size_t size = ggml_nbytes(src);
+    if (src_ctx->dev != dst_ctx->dev) {
+        if (size == 0) {
+            return true;
+        }
+
+        std::vector<uint8_t> staging;
+        try {
+            staging.resize(size);
+        } catch (const std::bad_alloc &) {
+            GGML_LOG_ERROR("ggml_d3d12: cross-device copy staging allocation failed (%zu bytes)\n", size);
+            return false;
+        }
+
+        ggml_backend_tensor_get(src, staging.data(), 0, size);
+        ggml_backend_tensor_set(dst, staging.data(), 0, size);
+        return true;
+    }
+
     if (!d3d12_device_ensure(dst_ctx->dev)) {
         return false;
     }
 
     const size_t src_offset = d3d12_tensor_offset(src_ctx, src, 0);
     const size_t dst_offset = d3d12_tensor_offset(dst_ctx, dst, 0);
-    const size_t size = ggml_nbytes(src);
 
     std::lock_guard<std::mutex> lock(dst_ctx->dev->submit_mutex);
     if (!d3d12_begin_commands_locked(dst_ctx->dev)) {
@@ -1323,18 +1386,25 @@ void ggml_backend_d3d12_get_device_memory(int device, size_t * free, size_t * to
 
     DXGI_QUERY_VIDEO_MEMORY_INFO info = {};
     HRESULT hr = dev->adapter->QueryVideoMemoryInfo(0, DXGI_MEMORY_SEGMENT_GROUP_LOCAL, &info);
-    if (FAILED(hr)) {
-        d3d12_log_hr("IDXGIAdapter3::QueryVideoMemoryInfo", hr);
+    if (SUCCEEDED(hr)) {
+        const UINT64 budget = info.Budget;
+        const UINT64 usage = info.CurrentUsage;
+        if (total != nullptr) {
+            *total = static_cast<size_t>(budget);
+        }
+        if (free != nullptr) {
+            *free = static_cast<size_t>(budget > usage ? budget - usage : 0);
+        }
         return;
     }
 
-    const UINT64 budget = info.Budget;
-    const UINT64 usage = info.CurrentUsage;
+    d3d12_log_hr("IDXGIAdapter3::QueryVideoMemoryInfo", hr);
+    const UINT64 fallback_memory = dev->desc.DedicatedVideoMemory != 0 ? dev->desc.DedicatedVideoMemory : dev->desc.SharedSystemMemory;
     if (total != nullptr) {
-        *total = static_cast<size_t>(budget);
+        *total = static_cast<size_t>(fallback_memory);
     }
     if (free != nullptr) {
-        *free = static_cast<size_t>(budget > usage ? budget - usage : 0);
+        *free = static_cast<size_t>(fallback_memory);
     }
 }
 

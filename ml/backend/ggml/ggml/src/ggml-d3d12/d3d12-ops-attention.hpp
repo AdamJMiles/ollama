@@ -1,6 +1,7 @@
 #pragma once
 
 #include <cstdint>
+#include <cstdlib>
 #include <cstring>
 #include <limits>
 
@@ -20,6 +21,20 @@ inline UINT attention_f32_bits(float value) {
     UINT bits = 0;
     std::memcpy(&bits, &value, sizeof(bits));
     return bits;
+}
+
+inline bool attention_fp16_enabled(ID3D12Device * device) {
+    if (std::getenv("GGML_D3D12_DISABLE_FP16") != nullptr || device == nullptr) {
+        return false;
+    }
+
+    D3D12_FEATURE_DATA_SHADER_MODEL sm = { D3D_SHADER_MODEL_6_8 };
+    if (FAILED(device->CheckFeatureSupport(D3D12_FEATURE_SHADER_MODEL, &sm, sizeof(sm))) || sm.HighestShaderModel < D3D_SHADER_MODEL_6_2) {
+        return false;
+    }
+
+    D3D12_FEATURE_DATA_D3D12_OPTIONS4 opt4 = {};
+    return SUCCEEDED(device->CheckFeatureSupport(D3D12_FEATURE_D3D12_OPTIONS4, &opt4, sizeof(opt4))) && opt4.Native16BitShaderOpsSupported != FALSE;
 }
 
 inline bool attention_fits_u32(uint64_t value) {
@@ -172,7 +187,8 @@ inline bool dispatch_attention(dispatch_ctx & ctx, const ggml_tensor * node) {
     ID3D12RootSignature * root_sig = ctx_get_root_sig(ctx, 5, 21);
     if (root_sig == nullptr) return true;
 
-    const char * shader = k->type == GGML_TYPE_F16 ? "flash_attn_ext_f32_f16" : "flash_attn_ext_f32_f32";
+    const char * shader = k->type == GGML_TYPE_F16 && attention_fp16_enabled(ctx.device) ? "flash_attn_ext_f32_f16_fp16" :
+        (k->type == GGML_TYPE_F16 ? "flash_attn_ext_f32_f16" : "flash_attn_ext_f32_f32");
     ID3D12PipelineState * pso = ctx.psos->get(shader, root_sig, {});
     if (pso == nullptr) return true;
 

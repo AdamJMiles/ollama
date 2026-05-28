@@ -1,11 +1,26 @@
 #pragma once
 
 #include <cstdint>
+#include <cstdlib>
 #include <limits>
 
 #include "d3d12-ops-common.hpp"
 
 namespace ggml_d3d12 {
+
+inline bool mulmm_fp16_enabled(ID3D12Device * device) {
+    if (std::getenv("GGML_D3D12_DISABLE_FP16") != nullptr || device == nullptr) {
+        return false;
+    }
+
+    D3D12_FEATURE_DATA_SHADER_MODEL sm = { D3D_SHADER_MODEL_6_8 };
+    if (FAILED(device->CheckFeatureSupport(D3D12_FEATURE_SHADER_MODEL, &sm, sizeof(sm))) || sm.HighestShaderModel < D3D_SHADER_MODEL_6_2) {
+        return false;
+    }
+
+    D3D12_FEATURE_DATA_D3D12_OPTIONS4 opt4 = {};
+    return SUCCEEDED(device->CheckFeatureSupport(D3D12_FEATURE_D3D12_OPTIONS4, &opt4, sizeof(opt4))) && opt4.Native16BitShaderOpsSupported != FALSE;
+}
 
 inline bool mulmm_u32(uint64_t v) {
     return v <= static_cast<uint64_t>(std::numeric_limits<UINT>::max());
@@ -61,7 +76,8 @@ inline bool dispatch_mulmm(dispatch_ctx & ctx, const ggml_tensor * node) {
 
     const ggml_tensor * src0 = node->src[0];
     const ggml_tensor * src1 = node->src[1];
-    const char * shader = src0->type == GGML_TYPE_F16 ? "mul_mm_f16_f32" : "mul_mm_f32_f32";
+    const char * shader = src0->type == GGML_TYPE_F16 && mulmm_fp16_enabled(ctx.device) ? "mul_mm_f16_f32_fp16" :
+        (src0->type == GGML_TYPE_F16 ? "mul_mm_f16_f32" : "mul_mm_f32_f32");
 
     const uint64_t M = static_cast<uint64_t>(node->ne[0]);
     const uint64_t N = static_cast<uint64_t>(node->ne[1]);
