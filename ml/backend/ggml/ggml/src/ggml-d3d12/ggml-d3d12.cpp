@@ -41,6 +41,10 @@
 #include "d3d12-ops-softmax.hpp"
 #include "d3d12-ops-glu.hpp"
 #include "d3d12-ops-misc.hpp"
+#include "d3d12-ops-shuffle.hpp"
+#include "d3d12-ops-rope.hpp"
+#include "d3d12-ops-conv.hpp"
+#include "d3d12-ops-dequant.hpp"
 
 #ifndef GGML_D3D12_HAS_SHADERS
 #if __has_include("ggml-d3d12-shaders.hpp")
@@ -1162,6 +1166,10 @@ static enum ggml_status ggml_backend_d3d12_graph_compute(ggml_backend_t backend,
         if (!handled && ggml_d3d12::dispatch_softmax(dctx, node))    handled = true;
         if (!handled && ggml_d3d12::dispatch_glu(dctx, node))        handled = true;
         if (!handled && ggml_d3d12::dispatch_misc(dctx, node))       handled = true;
+        if (!handled && ggml_d3d12::dispatch_shuffle(dctx, node))    handled = true;
+        if (!handled && ggml_d3d12::dispatch_rope(dctx, node))       handled = true;
+        if (!handled && ggml_d3d12::dispatch_conv(dctx, node))       handled = true;
+        if (!handled && ggml_d3d12::dispatch_dequant(dctx, node))    handled = true;
         // === end op dispatchers ===
 
         if (!handled) {
@@ -1376,6 +1384,10 @@ static bool ggml_backend_d3d12_device_supports_op(ggml_backend_dev_t dev, const 
     if (ggml_d3d12::supports_op_softmax(op))    return true;
     if (ggml_d3d12::supports_op_glu(op))        return true;
     if (ggml_d3d12::supports_op_misc(op))       return true;
+    if (ggml_d3d12::supports_op_shuffle(op))    return true;
+    if (ggml_d3d12::supports_op_rope(op))       return true;
+    if (ggml_d3d12::supports_op_conv(op))       return true;
+    if (ggml_d3d12::supports_op_dequant(op))    return true;
     // === end op support checks ===
 
     return false;
