@@ -67,6 +67,22 @@ static constexpr size_t D3D12_BUFFER_ALIGNMENT = 256;
 
 struct d3d12_device;
 
+// === d3d12_caps: per-device capabilities populated at init by d3d12_query_caps() ===
+// Perf-tuning op handlers and the buffer allocator consume these fields to gate
+// fast paths and to enforce GPU memory budget.
+struct d3d12_caps {
+    D3D_SHADER_MODEL shader_model = D3D_SHADER_MODEL_6_0; // highest SM the device supports (capped at 6_8)
+    bool native_16bit = false;                            // D3D12_OPTIONS4.Native16BitShaderOpsSupported
+    bool wave_ops    = false;                             // D3D12_OPTIONS1.WaveOps
+    UINT wave_lane_count_min = 0;
+    UINT wave_lane_count_max = 0;
+    UINT64 dedicated_video_memory = 0;                    // DXGI_ADAPTER_DESC1.DedicatedVideoMemory
+    UINT64 shared_system_memory   = 0;                    // DXGI_ADAPTER_DESC1.SharedSystemMemory
+    // Derived helpers
+    bool has_dp4a() const { return shader_model >= D3D_SHADER_MODEL_6_4; }
+    bool has_fp16() const { return shader_model >= D3D_SHADER_MODEL_6_2 && native_16bit; }
+};
+
 struct d3d12_buffer_type_context {
     d3d12_device * dev = nullptr;
 };
@@ -100,6 +116,7 @@ struct d3d12_device {
     ggml_d3d12::pso_cache psos;
     ggml_d3d12::root_sig_cache root_sigs;
     bool compute_ready = false;
+    d3d12_caps caps;
 
     ~d3d12_device() {
         if (upload && upload_ptr) {
@@ -481,6 +498,43 @@ static bool d3d12_device_ensure(d3d12_device * dev) {
         d3d12_log_hr("D3D12CreateDevice", hr);
         d3d12_release_runtime(dev);
         return false;
+    }
+
+    // === Query device capabilities for perf-tuning fast paths ===
+    {
+        static const D3D_SHADER_MODEL kProbeSMs[] = {
+            D3D_SHADER_MODEL_6_8, D3D_SHADER_MODEL_6_7, D3D_SHADER_MODEL_6_6,
+            D3D_SHADER_MODEL_6_5, D3D_SHADER_MODEL_6_4, D3D_SHADER_MODEL_6_3,
+            D3D_SHADER_MODEL_6_2, D3D_SHADER_MODEL_6_1, D3D_SHADER_MODEL_6_0,
+        };
+        dev->caps.shader_model = D3D_SHADER_MODEL_6_0;
+        for (D3D_SHADER_MODEL sm : kProbeSMs) {
+            D3D12_FEATURE_DATA_SHADER_MODEL data = { sm };
+            if (SUCCEEDED(dev->device->CheckFeatureSupport(D3D12_FEATURE_SHADER_MODEL, &data, sizeof(data))) && data.HighestShaderModel >= sm) {
+                dev->caps.shader_model = data.HighestShaderModel;
+                break;
+            }
+        }
+        D3D12_FEATURE_DATA_D3D12_OPTIONS1 opt1 = {};
+        if (SUCCEEDED(dev->device->CheckFeatureSupport(D3D12_FEATURE_D3D12_OPTIONS1, &opt1, sizeof(opt1)))) {
+            dev->caps.wave_ops            = opt1.WaveOps != FALSE;
+            dev->caps.wave_lane_count_min = opt1.WaveLaneCountMin;
+            dev->caps.wave_lane_count_max = opt1.WaveLaneCountMax;
+        }
+        D3D12_FEATURE_DATA_D3D12_OPTIONS4 opt4 = {};
+        if (SUCCEEDED(dev->device->CheckFeatureSupport(D3D12_FEATURE_D3D12_OPTIONS4, &opt4, sizeof(opt4)))) {
+            dev->caps.native_16bit = opt4.Native16BitShaderOpsSupported != FALSE;
+        }
+        dev->caps.dedicated_video_memory = dev->desc.DedicatedVideoMemory;
+        dev->caps.shared_system_memory   = dev->desc.SharedSystemMemory;
+        GGML_LOG_INFO("ggml_d3d12: %s caps: SM=6_%u wave_ops=%d lanes=[%u..%u] native_16bit=%d vram=%.1fGiB\n",
+                      dev->name.c_str(),
+                      static_cast<unsigned>(dev->caps.shader_model & 0xF),
+                      dev->caps.wave_ops ? 1 : 0,
+                      dev->caps.wave_lane_count_min,
+                      dev->caps.wave_lane_count_max,
+                      dev->caps.native_16bit ? 1 : 0,
+                      double(dev->caps.dedicated_video_memory) / double(1ull << 30));
     }
 
     D3D12_COMMAND_QUEUE_DESC queue_desc = {};
