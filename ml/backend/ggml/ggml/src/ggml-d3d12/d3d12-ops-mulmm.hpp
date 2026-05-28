@@ -8,8 +8,28 @@
 
 namespace ggml_d3d12 {
 
+inline bool mulmm_env_disable_fp16() {
+    static const bool v = std::getenv("GGML_D3D12_DISABLE_FP16") != nullptr;
+    return v;
+}
+
+inline bool mulmm_env_enable_gqa() {
+    static const bool v = std::getenv("GGML_D3D12_ENABLE_MULMM_GQA") != nullptr;
+    return v;
+}
+
+inline bool mulmm_env_q8_naive() {
+    static const bool v = std::getenv("GGML_D3D12_MULMM_Q8_NAIVE") != nullptr;
+    return v;
+}
+
+inline bool mulmm_fp16_enabled(dispatch_ctx & ctx) {
+    return !mulmm_env_disable_fp16() && ctx.caps_native_fp16;
+}
+
+// Back-compat shim for legacy callsites that still pass a raw device pointer.
 inline bool mulmm_fp16_enabled(ID3D12Device * device) {
-    if (std::getenv("GGML_D3D12_DISABLE_FP16") != nullptr || device == nullptr) {
+    if (mulmm_env_disable_fp16() || device == nullptr) {
         return false;
     }
 
@@ -81,7 +101,7 @@ inline bool supports_op_mulmm(const ggml_tensor * op) {
     // flash attention path yet); leave it opt-in until either the kernel is
     // tuned or FLASH_ATTN_EXT is implemented.
     if ((src1->ne[2] != src0->ne[2] || src1->ne[3] != src0->ne[3]) &&
-        std::getenv("GGML_D3D12_ENABLE_MULMM_GQA") == nullptr) {
+        !mulmm_env_enable_gqa()) {
         return false;
     }
 
@@ -103,10 +123,10 @@ inline bool dispatch_mulmm(dispatch_ctx & ctx, const ggml_tensor * node) {
 
     const char * shader;
     if (src0->type == GGML_TYPE_Q8_0) {
-        shader = (std::getenv("GGML_D3D12_MULMM_Q8_NAIVE") != nullptr)
+        shader = mulmm_env_q8_naive()
             ? "mul_mm_q8_0_f32_naive"
             : "mul_mm_q8_0_f32";
-    } else if (src0->type == GGML_TYPE_F16 && mulmm_fp16_enabled(ctx.device)) {
+    } else if (src0->type == GGML_TYPE_F16 && mulmm_fp16_enabled(ctx)) {
         shader = "mul_mm_f16_f32_fp16";
     } else if (src0->type == GGML_TYPE_F16) {
         shader = "mul_mm_f16_f32";

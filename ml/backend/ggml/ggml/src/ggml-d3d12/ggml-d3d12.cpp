@@ -1690,8 +1690,19 @@ static enum ggml_status ggml_backend_d3d12_graph_compute(ggml_backend_t backend,
     dctx.uav_heap   = &dev->uav_heap;
     dctx.psos       = &dev->psos;
     dctx.root_sigs  = &dev->root_sigs;
+    // Cache device caps so per-op dispatchers can short-circuit fast-path
+    // gating without re-querying CheckFeatureSupport (each query is a
+    // driver round-trip; cumulative cost across 700+ ops/graph x 3
+    // graphs/decode-token was significant).
+    dctx.caps_wave_ops    = dev->caps.wave_ops;
+    dctx.caps_native_fp16 = dev->caps.has_fp16();
+    dctx.caps_has_dp4a    = dev->caps.has_dp4a();
 
     ggml_d3d12::ctx_scratch_reset(dctx);
+
+    // Cache once per graph rather than calling std::getenv per-op (733+ ops
+    // per graph * 3 graphs/decode-token = 2200+ env lookups/token before).
+    const bool log_ops = std::getenv("GGML_D3D12_LOG_OPS") != nullptr;
 
     for (int i = 0; i < cgraph->n_nodes; ++i) {
         ggml_tensor * node = cgraph->nodes[i];
@@ -1710,7 +1721,7 @@ static enum ggml_status ggml_backend_d3d12_graph_compute(ggml_backend_t backend,
         }
 
         // Debug: dump every op we process. Enable with GGML_D3D12_LOG_OPS=1.
-        if (std::getenv("GGML_D3D12_LOG_OPS")) {
+        if (log_ops) {
             const ggml_tensor * s0 = node->src[0];
             const ggml_tensor * s1 = node->src[1];
             GGML_LOG_INFO("ggml_d3d12: op[%d] %s dst[%lld,%lld,%lld,%lld] type=%s%s%s%s%s\n",
@@ -1955,11 +1966,13 @@ static bool ggml_backend_d3d12_device_supports_op(ggml_backend_dev_t dev, const 
 
     // Debug kill-switch: comma-separated list of ggml op names (e.g.
     // "MUL_MAT,SET_ROWS,ROPE") to force-fallback to CPU. Used to bisect
-    // numerical bugs at runtime without rebuilds.
-    if (const char * disable = std::getenv("GGML_D3D12_DISABLE_OPS")) {
+    // numerical bugs at runtime without rebuilds. Cache the env value once
+    // since supports_op is called many times per token by the scheduler.
+    static const char * const disable_ops_env = std::getenv("GGML_D3D12_DISABLE_OPS");
+    if (disable_ops_env != nullptr) {
         const char * op_name = ggml_op_name(op->op);
         if (op_name != nullptr) {
-            const char * p = disable;
+            const char * p = disable_ops_env;
             while (*p) {
                 const char * comma = strchr(p, ',');
                 size_t len = comma ? (size_t)(comma - p) : strlen(p);
@@ -1991,7 +2004,8 @@ static bool ggml_backend_d3d12_device_supports_op(ggml_backend_dev_t dev, const 
     if (ggml_d3d12::supports_op_mulmatvec(op))  return true;
     // === end op support checks ===
 
-    if (std::getenv("GGML_D3D12_LOG_UNSUPPORTED")) {
+    static const bool log_unsupported = std::getenv("GGML_D3D12_LOG_UNSUPPORTED") != nullptr;
+    if (log_unsupported) {
         const ggml_tensor * s0 = op->src[0];
         const ggml_tensor * s1 = op->src[1];
         const ggml_tensor * s2 = op->src[2];

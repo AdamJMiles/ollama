@@ -42,6 +42,12 @@ namespace ggml_d3d12 {
 // Thin pointer-pack passed to every op handler. Implementations of the
 // `ctx_*` helpers in ggml-d3d12.cpp use `dev_opaque` to recover the
 // underlying `d3d12_device *` without exposing that type publicly.
+//
+// `caps_*` fields cache device capability bits that would otherwise require
+// calling `ID3D12Device::CheckFeatureSupport()` per-op (~750 mul_mat_vec
+// dispatches/decode-token x several feature queries each = thousands of
+// driver calls saved per token). Populated in graph_compute from
+// d3d12_caps before the dispatcher loop.
 struct dispatch_ctx {
     void *                       dev_opaque   = nullptr;
     ID3D12Device *               device       = nullptr;
@@ -49,6 +55,10 @@ struct dispatch_ctx {
     desc_heap_ring *             uav_heap     = nullptr;
     pso_cache *                  psos         = nullptr;
     root_sig_cache *             root_sigs    = nullptr;
+    // Cached device caps (populated once per graph_compute call).
+    bool                         caps_wave_ops    = false;
+    bool                         caps_native_fp16 = false;
+    bool                         caps_has_dp4a    = false;
 };
 
 // Resolved info about a tensor's underlying D3D12 storage.

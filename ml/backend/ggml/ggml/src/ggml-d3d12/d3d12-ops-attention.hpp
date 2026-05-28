@@ -23,8 +23,23 @@ inline UINT attention_f32_bits(float value) {
     return bits;
 }
 
+inline bool attention_env_disable_fp16() {
+    static const bool v = std::getenv("GGML_D3D12_DISABLE_FP16") != nullptr;
+    return v;
+}
+
+inline bool attention_env_enable_fa_f16_mask() {
+    static const bool v = std::getenv("GGML_D3D12_ENABLE_FA_F16_MASK") != nullptr;
+    return v;
+}
+
+inline bool attention_fp16_enabled(dispatch_ctx & ctx) {
+    return !attention_env_disable_fp16() && ctx.caps_native_fp16;
+}
+
+// Back-compat shim for legacy callsites that still pass a raw device pointer.
 inline bool attention_fp16_enabled(ID3D12Device * device) {
-    if (std::getenv("GGML_D3D12_DISABLE_FP16") != nullptr || device == nullptr) {
+    if (attention_env_disable_fp16() || device == nullptr) {
         return false;
     }
 
@@ -116,7 +131,7 @@ inline bool supports_op_attention(const ggml_tensor * op) {
         // mul_mat_vec + softmax chain for the F16-mask decode shape until
         // the kernel is tuned; keep it opt-in.
         if (mask->type == GGML_TYPE_F16 &&
-            std::getenv("GGML_D3D12_ENABLE_FA_F16_MASK") == nullptr) {
+            !attention_env_enable_fa_f16_mask()) {
             return false;
         }
     }
@@ -174,7 +189,7 @@ inline bool dispatch_attention(dispatch_ctx & ctx, const ggml_tensor * node) {
     ID3D12RootSignature * root_sig = ctx_get_root_sig(ctx, 5, 21);
     if (root_sig == nullptr) return true;
 
-    const char * shader = k->type == GGML_TYPE_F16 && attention_fp16_enabled(ctx.device) ? "flash_attn_ext_f32_f16_fp16" :
+    const char * shader = k->type == GGML_TYPE_F16 && attention_fp16_enabled(ctx) ? "flash_attn_ext_f32_f16_fp16" :
         (k->type == GGML_TYPE_F16 ? "flash_attn_ext_f32_f16" : "flash_attn_ext_f32_f32");
     ID3D12PipelineState * pso = ctx.psos->get(shader, root_sig, {});
     if (pso == nullptr) return true;

@@ -14,6 +14,16 @@
 
 namespace ggml_d3d12 {
 
+inline bool memops_env_disable_set_rows() {
+    static const bool v = std::getenv("GGML_D3D12_DISABLE_SET_ROWS") != nullptr;
+    return v;
+}
+
+inline bool memops_env_log_set_rows() {
+    static const bool v = std::getenv("GGML_D3D12_LOG_SET_ROWS") != nullptr;
+    return v;
+}
+
 inline bool supports_op_memops(const ggml_tensor * op) {
     if (op == nullptr) return false;
     switch (op->op) {
@@ -50,7 +60,7 @@ inline bool supports_op_memops(const ggml_tensor * op) {
             return false;
         }
         case GGML_OP_SET_ROWS: {
-            if (std::getenv("GGML_D3D12_DISABLE_SET_ROWS") != nullptr) return false;
+            if (memops_env_disable_set_rows()) return false;
             const ggml_tensor * src0 = op->src[0];
             const ggml_tensor * src1 = op->src[1];
             if (src0 == nullptr || src1 == nullptr) return false;
@@ -187,7 +197,7 @@ static bool dispatch_set_rows(dispatch_ctx & ctx, const ggml_tensor * node) {
     const tensor_resource idx_r = ctx_stage_tensor_uav(ctx, src1);
     const tensor_resource dst_r = ctx_stage_tensor_uav(ctx, node);
 
-    if (std::getenv("GGML_D3D12_LOG_SET_ROWS")) {
+    if (memops_env_log_set_rows()) {
         GGML_LOG_INFO("SET_ROWS valid=%d/%d/%d src0[%lld,%lld,%lld,%lld] nb=[%zu,%zu,%zu,%zu] type=%d  "
             "src1[%lld,%lld,%lld,%lld] nb=[%zu,%zu,%zu,%zu] type=%d  "
             "dst[%lld,%lld,%lld,%lld] nb=[%zu,%zu,%zu,%zu] type=%d  "

@@ -8,20 +8,40 @@
 
 namespace ggml_d3d12 {
 
-inline bool mulmatvec_wave_enabled(dispatch_ctx & ctx) {
-    if (std::getenv("GGML_D3D12_DISABLE_WAVE") != nullptr || ctx.device == nullptr) return false;
-
-    D3D12_FEATURE_DATA_D3D12_OPTIONS1 opts = {};
-    if (FAILED(ctx.device->CheckFeatureSupport(D3D12_FEATURE_D3D12_OPTIONS1, &opts, sizeof(opts)))) {
-        return false;
-    }
-    return opts.WaveOps != FALSE;
+// Cache env-var disable flags once on first access. These never change
+// at runtime and each std::getenv call is a string-comparison scan of
+// the entire environment; the previous per-op cost was significant
+// across 250+ mul_mat_vec ops/graph x 3 graphs/decode-token.
+inline bool mulmatvec_env_disable_wave() {
+    static const bool v = std::getenv("GGML_D3D12_DISABLE_WAVE") != nullptr;
+    return v;
+}
+inline bool mulmatvec_env_disable_fp16() {
+    static const bool v = std::getenv("GGML_D3D12_DISABLE_FP16") != nullptr;
+    return v;
+}
+inline bool mulmatvec_env_disable_dp4a() {
+    static const bool v = std::getenv("GGML_D3D12_DISABLE_DP4A") != nullptr;
+    return v;
+}
+inline bool mulmatvec_env_log_reject() {
+    static const bool v = std::getenv("GGML_D3D12_LOG_MMV_REJECT") != nullptr;
+    return v;
 }
 
+inline bool mulmatvec_wave_enabled(dispatch_ctx & ctx) {
+    return !mulmatvec_env_disable_wave() && ctx.caps_wave_ops;
+}
+
+inline bool mulmatvec_fp16_enabled(dispatch_ctx & ctx) {
+    return !mulmatvec_env_disable_fp16() && ctx.caps_native_fp16;
+}
+
+// Back-compat shim: older callers pass an ID3D12Device* directly. Since the
+// device-side feature query is now centralized in d3d12_caps, fall back to
+// the original CheckFeatureSupport path here to avoid plumbing a context.
 inline bool mulmatvec_fp16_enabled(ID3D12Device * device) {
-    if (std::getenv("GGML_D3D12_DISABLE_FP16") != nullptr || device == nullptr) {
-        return false;
-    }
+    if (mulmatvec_env_disable_fp16() || device == nullptr) return false;
 
     D3D12_FEATURE_DATA_SHADER_MODEL sm = { D3D_SHADER_MODEL_6_8 };
     if (FAILED(device->CheckFeatureSupport(D3D12_FEATURE_SHADER_MODEL, &sm, sizeof(sm))) || sm.HighestShaderModel < D3D_SHADER_MODEL_6_2) {
@@ -45,15 +65,11 @@ inline bool mulmatvec_supported_src0_type(ggml_type type) {
 }
 
 inline bool mulmatvec_dp4a_disabled() {
-    return std::getenv("GGML_D3D12_DISABLE_DP4A") != nullptr;
+    return mulmatvec_env_disable_dp4a();
 }
 
 inline bool mulmatvec_dp4a_enabled(dispatch_ctx & ctx, bool dp4a_disabled) {
-    if (dp4a_disabled || ctx.device == nullptr) return false;
-
-    D3D12_FEATURE_DATA_SHADER_MODEL sm = { D3D_SHADER_MODEL_6_4 };
-    return SUCCEEDED(ctx.device->CheckFeatureSupport(D3D12_FEATURE_SHADER_MODEL, &sm, sizeof(sm))) &&
-           sm.HighestShaderModel >= D3D_SHADER_MODEL_6_4;
+    return !dp4a_disabled && ctx.caps_has_dp4a;
 }
 
 inline const char * mulmatvec_shader_name(ggml_type type, bool native_fp16, bool use_wave, bool use_dp4a) {
@@ -112,7 +128,7 @@ inline bool supports_op_mulmatvec(const ggml_tensor * op) {
     const int64_t blck = ggml_blck_size(src0->type);
     if (ggml_is_quantized(src0->type) && (blck <= 0 || (src0->ne[0] % blck) != 0)) return false;
     if (!mulmatvec_src0_row_contiguous(src0)) {
-        if (std::getenv("GGML_D3D12_LOG_MMV_REJECT") != nullptr) {
+        if (mulmatvec_env_log_reject()) {
             GGML_LOG_INFO("mmv reject row-contig: s0=%s[%lld,%lld,%lld,%lld] nb=[%zu,%zu,%zu,%zu] (need nb[0]=%zu nb[1]=%zu)\n",
                 ggml_type_name(src0->type),
                 (long long)src0->ne[0], (long long)src0->ne[1], (long long)src0->ne[2], (long long)src0->ne[3],
@@ -133,7 +149,7 @@ inline bool dispatch_mulmatvec(dispatch_ctx & ctx, const ggml_tensor * node) {
     const ggml_tensor * src1 = node->src[1];
     const bool dp4a_disabled = mulmatvec_dp4a_disabled();
     const char * shader = mulmatvec_shader_name(src0->type,
-                                                mulmatvec_fp16_enabled(ctx.device),
+                                                mulmatvec_fp16_enabled(ctx),
                                                 mulmatvec_wave_enabled(ctx),
                                                 mulmatvec_dp4a_enabled(ctx, dp4a_disabled));
     if (shader == nullptr) return true;

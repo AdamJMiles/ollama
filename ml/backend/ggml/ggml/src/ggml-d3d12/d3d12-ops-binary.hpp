@@ -1,8 +1,15 @@
 #pragma once
 
+#include <cstdlib>
+
 #include "d3d12-ops-common.hpp"
 
 namespace ggml_d3d12 {
+
+inline bool binary_env_disable_bcast() {
+    static const bool v = std::getenv("GGML_D3D12_DISABLE_BINARY_BCAST") != nullptr;
+    return v;
+}
 
 inline bool binary_op_supported(enum ggml_op op) {
     switch (op) {
@@ -45,7 +52,7 @@ inline bool supports_op_binary(const ggml_tensor * op) {
     }
 
     // Broadcast path: src1 dims must divide src0 dims (ggml broadcast rules).
-    if (std::getenv("GGML_D3D12_DISABLE_BINARY_BCAST") != nullptr) return false;
+    if (binary_env_disable_bcast()) return false;
     if (!binary_is_broadcast_compatible(a, b)) return false;
     // src1 must have a sensible element-wise stride (4 bytes per F32) on dim0
     // so our shader can index it via byte offsets.

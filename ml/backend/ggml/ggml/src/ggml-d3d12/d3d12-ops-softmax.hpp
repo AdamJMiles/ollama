@@ -10,13 +10,9 @@
 namespace ggml_d3d12 {
 
 inline bool softmax_wave_enabled(dispatch_ctx & ctx) {
-    if (std::getenv("GGML_D3D12_DISABLE_WAVE") != nullptr || ctx.device == nullptr) return false;
-
-    D3D12_FEATURE_DATA_D3D12_OPTIONS1 opts = {};
-    if (FAILED(ctx.device->CheckFeatureSupport(D3D12_FEATURE_D3D12_OPTIONS1, &opts, sizeof(opts)))) {
-        return false;
-    }
-    return opts.WaveOps != FALSE;
+    // Cache GGML_D3D12_DISABLE_WAVE once; consult cached device caps for wave_ops.
+    static const bool disabled = std::getenv("GGML_D3D12_DISABLE_WAVE") != nullptr;
+    return !disabled && ctx.caps_wave_ops;
 }
 
 inline bool supports_op_softmax(const ggml_tensor * op) {
