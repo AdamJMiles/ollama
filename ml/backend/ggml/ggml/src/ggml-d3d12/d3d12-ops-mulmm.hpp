@@ -43,6 +43,15 @@ inline bool mulmm_shape_positive(const ggml_tensor * t) {
 inline bool mulmm_row_contiguous(const ggml_tensor * t) {
     if (!mulmm_shape_positive(t)) return false;
     const size_t es = ggml_type_size(t->type);
+    // For non-quantized types nb[0] equals the element size and the row stride
+    // is es * ne[0]. For quantized types nb[0] is the block size in bytes and
+    // the row stride is ggml_row_size(type, ne[0]) (covers blocks of QK
+    // elements at a time).
+    if (ggml_is_quantized(t->type)) {
+        const int64_t blck = ggml_blck_size(t->type);
+        if (blck <= 0 || (t->ne[0] % blck) != 0) return false;
+        return t->nb[0] == es && t->nb[1] == ggml_row_size(t->type, t->ne[0]);
+    }
     return t->nb[0] == es && t->nb[1] == es * static_cast<size_t>(t->ne[0]);
 }
 
@@ -54,7 +63,14 @@ inline bool supports_op_mulmm(const ggml_tensor * op) {
     if (!mulmm_shape_positive(src0) || !mulmm_shape_positive(src1) || !mulmm_shape_positive(op)) return false;
 
     if (src1->ne[1] < 2) return false;
-    if (src0->type != GGML_TYPE_F32 && src0->type != GGML_TYPE_F16) return false;
+    if (src0->type != GGML_TYPE_F32 && src0->type != GGML_TYPE_F16 && src0->type != GGML_TYPE_Q8_0) return false;
+    // Q8_0 mul_mm groundwork (dequant + tiled and naive shaders, plus the
+    // ne-broadcast plumbing) is in place but currently produces incorrect
+    // results for the Qwen2.5-style decode shapes that this path would
+    // intercept (root cause TBD). Keep it opt-in until the bug is fixed
+    // — without it the prompt-eval / chunked-decode Q8_0 mul_mats stay on
+    // CPU as before.
+    if (src0->type == GGML_TYPE_Q8_0 && std::getenv("GGML_D3D12_ENABLE_MULMM_Q8_0") == nullptr) return false;
     if (src1->type != GGML_TYPE_F32 || op->type != GGML_TYPE_F32) return false;
     if (src0->ne[0] != src1->ne[0]) return false;
     if (op->ne[0] != src0->ne[1] || op->ne[1] != src1->ne[1]) return false;
@@ -64,6 +80,9 @@ inline bool supports_op_mulmm(const ggml_tensor * op) {
     if (src0->ne[2] == 0 || src0->ne[3] == 0) return false;
     if (src1->ne[2] % src0->ne[2] != 0) return false;
     if (src1->ne[3] % src0->ne[3] != 0) return false;
+    // Q8_0 needs K divisible by the 32-element block size for the per-block
+    // dequantisation path; this is true for every real LLM weight matrix.
+    if (src0->type == GGML_TYPE_Q8_0 && (src0->ne[0] % 32) != 0) return false;
     // GQA mul_mm is currently slower than the CPU fallback for the very
     // large attention shapes that Qwen-style models hit during decode (no
     // flash attention path yet); leave it opt-in until either the kernel is
@@ -88,8 +107,18 @@ inline bool dispatch_mulmm(dispatch_ctx & ctx, const ggml_tensor * node) {
 
     const ggml_tensor * src0 = node->src[0];
     const ggml_tensor * src1 = node->src[1];
-    const char * shader = src0->type == GGML_TYPE_F16 && mulmm_fp16_enabled(ctx.device) ? "mul_mm_f16_f32_fp16" :
-        (src0->type == GGML_TYPE_F16 ? "mul_mm_f16_f32" : "mul_mm_f32_f32");
+    const char * shader;
+    if (src0->type == GGML_TYPE_Q8_0) {
+        shader = (std::getenv("GGML_D3D12_MULMM_Q8_NAIVE") != nullptr)
+            ? "mul_mm_q8_0_f32_naive"
+            : "mul_mm_q8_0_f32";
+    } else if (src0->type == GGML_TYPE_F16 && mulmm_fp16_enabled(ctx.device)) {
+        shader = "mul_mm_f16_f32_fp16";
+    } else if (src0->type == GGML_TYPE_F16) {
+        shader = "mul_mm_f16_f32";
+    } else {
+        shader = "mul_mm_f32_f32";
+    }
 
     const uint64_t M = static_cast<uint64_t>(node->ne[0]);
     const uint64_t N = static_cast<uint64_t>(node->ne[1]);
@@ -124,7 +153,16 @@ inline bool dispatch_mulmm(dispatch_ctx & ctx, const ggml_tensor * node) {
     }
 
     const size_t src0_es = ggml_type_size(src0->type);
-    if ((s0r.offset_bytes % src0_es) != 0 || (src0->nb[2] % src0_es) != 0 || (src0->nb[3] % src0_es) != 0) return true;
+    // Q8_0 nb[2]/nb[3] are byte offsets to the next batch slice which need not
+    // be multiples of the 34-byte block size (e.g. row 1 of a ne[1]=3584
+    // matrix lands 3808 bytes in, but the next slice lands at 3808*3584 ==
+    // 13_651_712 bytes, which is not divisible by 34). The shader only
+    // dereferences nb[2]/nb[3] when the corresponding batch dim is actually
+    // broadcast/non-singleton, so guard the stride alignment on a per-axis
+    // basis using the broadcast factors we already computed for src1->ne.
+    if ((s0r.offset_bytes % src0_es) != 0) return true;
+    if (src0->ne[2] > 1 && (src0->nb[2] % src0_es) != 0) return true;
+    if (src0->ne[3] > 1 && (src0->nb[3] % src0_es) != 0) return true;
     if ((s1r.offset_bytes % sizeof(float)) != 0 || (dr.offset_bytes % sizeof(float)) != 0) return true;
 
     const uint64_t dims_and_strides[] = {
