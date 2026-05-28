@@ -77,9 +77,13 @@ inline bool mulmatvec_fits_u32(uint64_t value) {
 
 inline bool mulmatvec_src0_row_contiguous(const ggml_tensor * src0) {
     if (src0 == nullptr || src0->ne[0] <= 0) return false;
+    // We only need contiguity *within* a row (so the shader can step by
+    // nb[0] == elem_size to walk K elements). The row-to-row stride is
+    // passed in as src0_row_stride (= nb[1]) and works for permuted views
+    // (e.g. the unified KV cache laid out as [head_dim, n_kv, n_ctx] but
+    // viewed as [head_dim, n_ctx, n_kv]).
     const size_t block_bytes = ggml_type_size(src0->type);
-    const size_t row_bytes = ggml_row_size(src0->type, src0->ne[0]);
-    return src0->nb[0] == block_bytes && src0->nb[1] == row_bytes;
+    return src0->nb[0] == block_bytes;
 }
 
 inline bool supports_op_mulmatvec(const ggml_tensor * op) {
@@ -107,7 +111,17 @@ inline bool supports_op_mulmatvec(const ggml_tensor * op) {
 
     const int64_t blck = ggml_blck_size(src0->type);
     if (ggml_is_quantized(src0->type) && (blck <= 0 || (src0->ne[0] % blck) != 0)) return false;
-    if (!mulmatvec_src0_row_contiguous(src0)) return false;
+    if (!mulmatvec_src0_row_contiguous(src0)) {
+        if (std::getenv("GGML_D3D12_LOG_MMV_REJECT") != nullptr) {
+            GGML_LOG_INFO("mmv reject row-contig: s0=%s[%lld,%lld,%lld,%lld] nb=[%zu,%zu,%zu,%zu] (need nb[0]=%zu nb[1]=%zu)\n",
+                ggml_type_name(src0->type),
+                (long long)src0->ne[0], (long long)src0->ne[1], (long long)src0->ne[2], (long long)src0->ne[3],
+                src0->nb[0], src0->nb[1], src0->nb[2], src0->nb[3],
+                ggml_type_size(src0->type),
+                ggml_row_size(src0->type, src0->ne[0]));
+        }
+        return false;
+    }
 
     return true;
 }

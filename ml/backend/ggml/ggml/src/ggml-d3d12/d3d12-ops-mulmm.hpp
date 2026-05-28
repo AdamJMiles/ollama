@@ -42,17 +42,17 @@ inline bool mulmm_shape_positive(const ggml_tensor * t) {
 
 inline bool mulmm_row_contiguous(const ggml_tensor * t) {
     if (!mulmm_shape_positive(t)) return false;
+    // Only require *within-row* contiguity (nb[0] == elem/block size). The
+    // row-to-row stride is passed in as src0_nb1 and works for permuted
+    // views (e.g. the unified KV cache laid out as [head_dim, n_kv, n_ctx]
+    // but viewed as [head_dim, n_ctx, n_kv]).
     const size_t es = ggml_type_size(t->type);
-    // For non-quantized types nb[0] equals the element size and the row stride
-    // is es * ne[0]. For quantized types nb[0] is the block size in bytes and
-    // the row stride is ggml_row_size(type, ne[0]) (covers blocks of QK
-    // elements at a time).
     if (ggml_is_quantized(t->type)) {
         const int64_t blck = ggml_blck_size(t->type);
         if (blck <= 0 || (t->ne[0] % blck) != 0) return false;
-        return t->nb[0] == es && t->nb[1] == ggml_row_size(t->type, t->ne[0]);
+        return t->nb[0] == es;
     }
-    return t->nb[0] == es && t->nb[1] == es * static_cast<size_t>(t->ne[0]);
+    return t->nb[0] == es;
 }
 
 inline bool supports_op_mulmm(const ggml_tensor * op) {
