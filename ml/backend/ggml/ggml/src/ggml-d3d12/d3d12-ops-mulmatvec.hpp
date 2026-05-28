@@ -138,11 +138,6 @@ inline bool dispatch_mulmatvec(dispatch_ctx & ctx, const ggml_tensor * node) {
                                                 mulmatvec_dp4a_enabled(ctx, dp4a_disabled));
     if (shader == nullptr) return true;
 
-    const tensor_resource w_res = ctx_resolve_tensor(ctx, src0);
-    const tensor_resource x_res = ctx_resolve_tensor(ctx, src1);
-    const tensor_resource y_res = ctx_resolve_tensor(ctx, node);
-    if (!w_res.valid || !x_res.valid || !y_res.valid) return true;
-
     const uint64_t K = static_cast<uint64_t>(src0->ne[0]);
     const uint64_t M = static_cast<uint64_t>(src0->ne[1]);
     const uint64_t ne2 = static_cast<uint64_t>(src1->ne[2]);
@@ -152,16 +147,13 @@ inline bool dispatch_mulmatvec(dispatch_ctx & ctx, const ggml_tensor * node) {
     const uint64_t broadcast2 = static_cast<uint64_t>(src1->ne[2]) / static_cast<uint64_t>(src0->ne[2]);
     const uint64_t broadcast3 = static_cast<uint64_t>(src1->ne[3]) / static_cast<uint64_t>(src0->ne[3]);
 
-    const uint64_t constants[] = {
-        K,
-        M,
-        batch,
+    // Stride-only values that go to the shader as UINTs. Offsets are handled
+    // separately via the sliding-UAV bind below.
+    const uint64_t stride_constants[] = {
+        K, M, batch,
         static_cast<uint64_t>(src0->nb[1]),
         static_cast<uint64_t>(src1->nb[2]),
         static_cast<uint64_t>(node->nb[2]),
-        static_cast<uint64_t>(w_res.offset_bytes),
-        static_cast<uint64_t>(x_res.offset_bytes),
-        static_cast<uint64_t>(y_res.offset_bytes),
         ne2,
         static_cast<uint64_t>(src0->nb[2]),
         static_cast<uint64_t>(src0->nb[3]),
@@ -172,19 +164,26 @@ inline bool dispatch_mulmatvec(dispatch_ctx & ctx, const ggml_tensor * node) {
         broadcast2,
         broadcast3,
     };
-    for (uint64_t value : constants) {
+    for (uint64_t value : stride_constants) {
         if (!mulmatvec_fits_u32(value)) return true;
     }
-    if ((x_res.offset_bytes % sizeof(float)) != 0 || (y_res.offset_bytes % sizeof(float)) != 0) return true;
-    if (src0->type == GGML_TYPE_F32 && (w_res.offset_bytes % sizeof(float)) != 0) return true;
 
     if (!ctx_transition(ctx, src0, D3D12_RESOURCE_STATE_UNORDERED_ACCESS)) return true;
     if (!ctx_transition(ctx, src1, D3D12_RESOURCE_STATE_UNORDERED_ACCESS)) return true;
     if (!ctx_transition(ctx, node, D3D12_RESOURCE_STATE_UNORDERED_ACCESS)) return true;
 
+    // Sliding-UAV bind so the shader can address tensors that live past the
+    // 4 GB shader-uint boundary in a > 4 GB parent buffer (e.g. Q8_0 model
+    // weights staged into a single 7 GB scratch buffer).
     D3D12_GPU_DESCRIPTOR_HANDLE uav_table = {};
     const ggml_tensor * uavs[3] = { src0, src1, node };
-    if (!ctx_bind_raw_uavs(ctx, uavs, 3, &uav_table)) return true;
+    uint32_t shader_offsets[3] = { 0, 0, 0 };
+    if (!ctx_bind_raw_uavs_sliding(ctx, uavs, 3, &uav_table, shader_offsets)) return true;
+    // F32 src0 needs 4-byte aligned shader address; F16/Q8_0 use load_u8 so
+    // 2-byte alignment is enough (and is always satisfied since FirstElement
+    // is 4-byte aligned). src1 (F32) and dst (F32) need 4-byte alignment.
+    if (src0->type == GGML_TYPE_F32 && (shader_offsets[0] % sizeof(float)) != 0) return true;
+    if ((shader_offsets[1] % sizeof(float)) != 0 || (shader_offsets[2] % sizeof(float)) != 0) return true;
 
     ID3D12RootSignature * root_sig = ctx_get_root_sig(ctx, 3, 18);
     if (root_sig == nullptr) return true;
@@ -198,9 +197,9 @@ inline bool dispatch_mulmatvec(dispatch_ctx & ctx, const ggml_tensor * node) {
         static_cast<UINT>(src0->nb[1]),
         static_cast<UINT>(src1->nb[2]),
         static_cast<UINT>(node->nb[2]),
-        static_cast<UINT>(w_res.offset_bytes),
-        static_cast<UINT>(x_res.offset_bytes),
-        static_cast<UINT>(y_res.offset_bytes),
+        shader_offsets[0],
+        shader_offsets[1],
+        shader_offsets[2],
         static_cast<UINT>(ne2),
         static_cast<UINT>(src0->nb[2]),
         static_cast<UINT>(src0->nb[3]),

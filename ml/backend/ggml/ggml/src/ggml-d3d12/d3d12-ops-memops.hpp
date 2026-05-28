@@ -76,10 +76,6 @@ inline bool dispatch_memops(dispatch_ctx & ctx, const ggml_tensor * node) {
 static bool dispatch_cpy_dup(dispatch_ctx & ctx, const ggml_tensor * node) {
     const ggml_tensor * src = node->src[0];
 
-    const tensor_resource src_r = ctx_resolve_tensor(ctx, src);
-    const tensor_resource dst_r = ctx_resolve_tensor(ctx, node);
-    if (!src_r.valid || !dst_r.valid) return true; // claimed but failed
-
     if (src->type == GGML_TYPE_F32 && node->type == GGML_TYPE_F16) {
         // F32 -> F16 conversion. Each thread emits one 32-bit store covering
         // two F16 dst elements; a trailing odd element RMWs the half-uint.
@@ -90,16 +86,15 @@ static bool dispatch_cpy_dup(dispatch_ctx & ctx, const ggml_tensor * node) {
         const uint64_t src_bytes = elem_count * sizeof(float);
         const uint64_t dst_bytes = ((elem_count + 1ull) / 2ull) * 4ull;
         if (src_bytes > 0xFFFFFFFFull || dst_bytes > 0xFFFFFFFFull) return true;
-        if ((src_r.offset_bytes % 4) != 0 || (dst_r.offset_bytes % 4) != 0) return true;
-        if (src_r.offset_bytes > 0xFFFFFFFFull - src_bytes) return true;
-        if (dst_r.offset_bytes > 0xFFFFFFFFull - dst_bytes) return true;
 
         if (!ctx_transition(ctx, src, D3D12_RESOURCE_STATE_UNORDERED_ACCESS)) return true;
         if (!ctx_transition(ctx, node, D3D12_RESOURCE_STATE_UNORDERED_ACCESS)) return true;
 
         D3D12_GPU_DESCRIPTOR_HANDLE uav_table = {};
         const ggml_tensor * uavs[2] = { src, node };
-        if (!ctx_bind_raw_uavs(ctx, uavs, 2, &uav_table)) return true;
+        uint32_t off[2] = { 0, 0 };
+        if (!ctx_bind_raw_uavs_sliding(ctx, uavs, 2, &uav_table, off)) return true;
+        if ((off[0] % 4) != 0 || (off[1] % 4) != 0) return true;
 
         ID3D12RootSignature * root_sig = ctx_get_root_sig(ctx, 2, 4);
         if (root_sig == nullptr) return true;
@@ -109,8 +104,8 @@ static bool dispatch_cpy_dup(dispatch_ctx & ctx, const ggml_tensor * node) {
 
         const UINT consts[4] = {
             static_cast<UINT>(elem_count),
-            static_cast<UINT>(src_r.offset_bytes),
-            static_cast<UINT>(dst_r.offset_bytes),
+            off[0],
+            off[1],
             0,
         };
         if (!ctx_bind_compute(ctx, pso, root_sig, uav_table, 2, consts, 4)) return true;
@@ -125,34 +120,31 @@ static bool dispatch_cpy_dup(dispatch_ctx & ctx, const ggml_tensor * node) {
     const size_t bytes = ggml_nbytes(src);
     if (bytes == 0) return true; // trivial no-op
     if ((bytes % 4) != 0) return true;
-    if ((src_r.offset_bytes % 4) != 0 || (dst_r.offset_bytes % 4) != 0) return true;
-    if (bytes > 0xFFFFFFFFull ||
-        src_r.offset_bytes > 0xFFFFFFFFull ||
-        dst_r.offset_bytes > 0xFFFFFFFFull) {
-        return true;
-    }
+    if (bytes > 0xFFFFFFFFull) return true;
 
     if (!ctx_transition(ctx, src, D3D12_RESOURCE_STATE_UNORDERED_ACCESS)) return true;
     if (!ctx_transition(ctx, node, D3D12_RESOURCE_STATE_UNORDERED_ACCESS)) return true;
 
-    D3D12_GPU_DESCRIPTOR_HANDLE uav_table = {};
-    const ggml_tensor * uavs[2] = { src, node };
-    if (!ctx_bind_raw_uavs(ctx, uavs, 2, &uav_table)) return true;
+    D3D12_GPU_DESCRIPTOR_HANDLE uav_table2 = {};
+    const ggml_tensor * uavs2[2] = { src, node };
+    uint32_t off2[2] = { 0, 0 };
+    if (!ctx_bind_raw_uavs_sliding(ctx, uavs2, 2, &uav_table2, off2)) return true;
+    if ((off2[0] % 4) != 0 || (off2[1] % 4) != 0) return true;
 
-    ID3D12RootSignature * root_sig = ctx_get_root_sig(ctx, /*uav=*/2, /*dwords=*/4);
-    if (root_sig == nullptr) return true;
+    ID3D12RootSignature * root_sig2 = ctx_get_root_sig(ctx, /*uav=*/2, /*dwords=*/4);
+    if (root_sig2 == nullptr) return true;
 
-    ID3D12PipelineState * pso = ctx.psos->get("copy_f32", root_sig, {});
-    if (pso == nullptr) return true;
+    ID3D12PipelineState * pso2 = ctx.psos->get("copy_f32", root_sig2, {});
+    if (pso2 == nullptr) return true;
 
-    const UINT consts[4] = {
+    const UINT consts2[4] = {
         static_cast<UINT>(bytes),
-        static_cast<UINT>(src_r.offset_bytes),
-        static_cast<UINT>(dst_r.offset_bytes),
+        off2[0],
+        off2[1],
         0,
     };
 
-    if (!ctx_bind_compute(ctx, pso, root_sig, uav_table, /*uav=*/2, consts, /*dwords=*/4)) {
+    if (!ctx_bind_compute(ctx, pso2, root_sig2, uav_table2, /*uav=*/2, consts2, /*dwords=*/4)) {
         return true;
     }
 

@@ -79,26 +79,21 @@ inline bool dispatch_binary(dispatch_ctx & ctx, const ggml_tensor * node) {
         }
     }
 
-    const tensor_resource ar = ctx_resolve_tensor(ctx, a);
-    const tensor_resource br = ctx_resolve_tensor(ctx, b);
-    const tensor_resource dr = ctx_resolve_tensor(ctx, node);
-    if (!ar.valid || !br.valid || !dr.valid) return true;
-
     const size_t count = ggml_nelements(node);
     if (count == 0) return true;
-    if ((ar.offset_bytes % 4) != 0 || (br.offset_bytes % 4) != 0 || (dr.offset_bytes % 4) != 0) return true;
-    if (count > 0xFFFFFFFFull ||
-        ar.offset_bytes > 0xFFFFFFFFull ||
-        br.offset_bytes > 0xFFFFFFFFull ||
-        dr.offset_bytes > 0xFFFFFFFFull) return true;
+    if (count > 0xFFFFFFFFull) return true;
 
     if (!ctx_transition(ctx, a, D3D12_RESOURCE_STATE_UNORDERED_ACCESS)) return true;
     if (!ctx_transition(ctx, b, D3D12_RESOURCE_STATE_UNORDERED_ACCESS)) return true;
     if (!ctx_transition(ctx, node, D3D12_RESOURCE_STATE_UNORDERED_ACCESS)) return true;
 
+    // Sliding-UAV bind: shader address 0 == tensor start, so offsets > 4 GB
+    // in a > 4 GB parent buffer are addressable.
     D3D12_GPU_DESCRIPTOR_HANDLE uav_table = {};
     const ggml_tensor * uavs[3] = { a, b, node };
-    if (!ctx_bind_raw_uavs(ctx, uavs, 3, &uav_table)) return true;
+    uint32_t off[3] = { 0, 0, 0 };
+    if (!ctx_bind_raw_uavs_sliding(ctx, uavs, 3, &uav_table, off)) return true;
+    if ((off[0] % 4) != 0 || (off[1] % 4) != 0 || (off[2] % 4) != 0) return true;
 
     if (same_shape) {
         ID3D12RootSignature * root_sig = ctx_get_root_sig(ctx, 3, 4);
@@ -108,9 +103,9 @@ inline bool dispatch_binary(dispatch_ctx & ctx, const ggml_tensor * node) {
 
         const UINT consts[4] = {
             static_cast<UINT>(count),
-            static_cast<UINT>(ar.offset_bytes),
-            static_cast<UINT>(br.offset_bytes),
-            static_cast<UINT>(dr.offset_bytes),
+            off[0],
+            off[1],
+            off[2],
         };
         if (!ctx_bind_compute(ctx, pso, root_sig, uav_table, 3, consts, 4)) return true;
 
@@ -137,9 +132,9 @@ inline bool dispatch_binary(dispatch_ctx & ctx, const ggml_tensor * node) {
         static_cast<UINT>(a->ne[0]), static_cast<UINT>(a->ne[1]), static_cast<UINT>(a->ne[2]), static_cast<UINT>(a->ne[3]),
         static_cast<UINT>(b->ne[0]), static_cast<UINT>(b->ne[1]), static_cast<UINT>(b->ne[2]), static_cast<UINT>(b->ne[3]),
         static_cast<UINT>(b->nb[0]), static_cast<UINT>(b->nb[1]), static_cast<UINT>(b->nb[2]), static_cast<UINT>(b->nb[3]),
-        static_cast<UINT>(ar.offset_bytes),
-        static_cast<UINT>(br.offset_bytes),
-        static_cast<UINT>(dr.offset_bytes),
+        off[0],
+        off[1],
+        off[2],
     };
     if (!ctx_bind_compute(ctx, pso, root_sig, uav_table, 3, consts, 16)) return true;
 

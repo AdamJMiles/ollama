@@ -56,16 +56,6 @@ inline bool dispatch_softmax(dispatch_ctx & ctx, const ggml_tensor * node) {
     float scale = 1.0f;
     std::memcpy(&scale, node->op_params, sizeof(float));
 
-    const tensor_resource sr = ctx_resolve_tensor(ctx, src);
-    const tensor_resource dr = ctx_resolve_tensor(ctx, node);
-    if (!sr.valid || !dr.valid) return true;
-
-    tensor_resource mr{};
-    if (mask != nullptr) {
-        mr = ctx_resolve_tensor(ctx, mask);
-        if (!mr.valid) return true;
-    }
-
     const int64_t ne0_i = src->ne[0];
     const int64_t n_rows_i = src->ne[1] * src->ne[2] * src->ne[3];
     if (ne0_i <= 0 || n_rows_i <= 0) return true;
@@ -73,31 +63,24 @@ inline bool dispatch_softmax(dispatch_ctx & ctx, const ggml_tensor * node) {
     const uint64_t ne0 = static_cast<uint64_t>(ne0_i);
     const uint64_t n_rows = static_cast<uint64_t>(n_rows_i);
     const uint64_t u32_max = std::numeric_limits<UINT>::max();
-    const uint64_t u32_range = u32_max + 1ull;
     if (n_rows > u32_max || ne0 > u32_max / sizeof(float)) return true;
 
     const uint64_t row_bytes = ne0 * sizeof(float);
-    if (row_bytes == 0 || row_bytes > u32_max || n_rows > u32_range / row_bytes) return true;
-
-    const uint64_t total_bytes = row_bytes * n_rows;
-    if ((sr.offset_bytes % sizeof(float)) != 0 || (dr.offset_bytes % sizeof(float)) != 0) return true;
-    if (mask != nullptr && (mr.offset_bytes % sizeof(float)) != 0) return true;
-    if (sr.offset_bytes > u32_max || dr.offset_bytes > u32_max) return true;
-    if (total_bytes > u32_range - static_cast<uint64_t>(sr.offset_bytes)) return true;
-    if (total_bytes > u32_range - static_cast<uint64_t>(dr.offset_bytes)) return true;
-    if (mask != nullptr) {
-        if (mr.offset_bytes > u32_max) return true;
-        if (total_bytes > u32_range - static_cast<uint64_t>(mr.offset_bytes)) return true;
-    }
+    if (row_bytes == 0 || row_bytes > u32_max) return true;
 
     if (!ctx_transition(ctx, src, D3D12_RESOURCE_STATE_UNORDERED_ACCESS)) return true;
     if (mask != nullptr && !ctx_transition(ctx, mask, D3D12_RESOURCE_STATE_UNORDERED_ACCESS)) return true;
     if (!ctx_transition(ctx, node, D3D12_RESOURCE_STATE_UNORDERED_ACCESS)) return true;
 
+    // Sliding UAVs so the dispatcher works for tensors past the 4 GB shader
+    // address boundary in a > 4 GB parent buffer.
     D3D12_GPU_DESCRIPTOR_HANDLE uav_table = {};
     const ggml_tensor * mask_for_bind = mask != nullptr ? mask : src;
     const ggml_tensor * uavs[3] = { src, mask_for_bind, node };
-    if (!ctx_bind_raw_uavs(ctx, uavs, 3, &uav_table)) return true;
+    uint32_t off[3] = { 0, 0, 0 };
+    if (!ctx_bind_raw_uavs_sliding(ctx, uavs, 3, &uav_table, off)) return true;
+    if ((off[0] % sizeof(float)) != 0 || (off[2] % sizeof(float)) != 0) return true;
+    if (mask != nullptr && (off[1] % sizeof(float)) != 0) return true;
 
     ID3D12RootSignature * root_sig = ctx_get_root_sig(ctx, 3, 12);
     if (root_sig == nullptr) return true;
@@ -116,9 +99,9 @@ inline bool dispatch_softmax(dispatch_ctx & ctx, const ggml_tensor * node) {
         static_cast<UINT>(src->ne[2]),
         static_cast<UINT>(mask_for_dims->ne[2]),
         static_cast<UINT>(mask_for_dims->ne[3]),
-        static_cast<UINT>(sr.offset_bytes),
-        static_cast<UINT>(dr.offset_bytes),
-        static_cast<UINT>(mask != nullptr ? mr.offset_bytes : 0),
+        off[0],
+        off[2],
+        mask != nullptr ? off[1] : 0u,
         static_cast<UINT>(mask != nullptr ? row_bytes : 0),
         scale_bits,
         mask != nullptr ? 1u : 0u,

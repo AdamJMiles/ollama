@@ -138,34 +138,11 @@ inline bool dispatch_attention(dispatch_ctx & ctx, const ggml_tensor * node) {
     const ggml_tensor * v    = node->src[2];
     const ggml_tensor * mask = node->src[3];
 
-    const tensor_resource qr = ctx_resolve_tensor(ctx, q);
-    const tensor_resource kr = ctx_resolve_tensor(ctx, k);
-    const tensor_resource vr = ctx_resolve_tensor(ctx, v);
-    const tensor_resource dr = ctx_resolve_tensor(ctx, node);
-    if (!qr.valid || !kr.valid || !vr.valid || !dr.valid) return true;
-
-    tensor_resource mr{};
-    if (mask != nullptr) {
-        mr = ctx_resolve_tensor(ctx, mask);
-        if (!mr.valid) return true;
-    }
-
     const uint64_t D     = static_cast<uint64_t>(q->ne[0]);
     const uint64_t nq    = static_cast<uint64_t>(q->ne[1]);
     const uint64_t nh    = static_cast<uint64_t>(q->ne[2]);
     const uint64_t nkv   = static_cast<uint64_t>(k->ne[1]);
     const uint64_t nh_kv = static_cast<uint64_t>(k->ne[2]);
-
-    const uint64_t q_elem = ggml_type_size(q->type);
-    const uint64_t k_elem = ggml_type_size(k->type);
-    const uint64_t v_elem = ggml_type_size(v->type);
-    const uint64_t d_elem = ggml_type_size(node->type);
-
-    if (!attention_tensor_span_fits_u32(qr.offset_bytes, D, nq, nh, q->nb[0], q->nb[1], q->nb[2], q_elem)) return true;
-    if (!attention_tensor_span_fits_u32(kr.offset_bytes, D, nkv, nh_kv, k->nb[0], k->nb[1], k->nb[2], k_elem)) return true;
-    if (!attention_tensor_span_fits_u32(vr.offset_bytes, D, nkv, nh_kv, v->nb[0], v->nb[1], v->nb[2], v_elem)) return true;
-    if (!attention_tensor_span_fits_u32(dr.offset_bytes, D, nh, nq, node->nb[0], node->nb[1], node->nb[2], d_elem)) return true;
-    if (mask != nullptr && !attention_tensor_span_fits_u32(mr.offset_bytes, nkv, nq, 1, mask->nb[0], mask->nb[1], mask->nb[2], ggml_type_size(mask->type))) return true;
 
     if (!attention_fits_u32(q->nb[1]) || !attention_fits_u32(q->nb[2]) ||
         !attention_fits_u32(k->nb[1]) || !attention_fits_u32(k->nb[2]) ||
@@ -174,12 +151,6 @@ inline bool dispatch_attention(dispatch_ctx & ctx, const ggml_tensor * node) {
         (mask != nullptr && !attention_fits_u32(mask->nb[1]))) {
         return true;
     }
-
-    if ((qr.offset_bytes % 4) != 0 || (dr.offset_bytes % 4) != 0) return true;
-    if (k->type == GGML_TYPE_F32 && (kr.offset_bytes % 4) != 0) return true;
-    if (v->type == GGML_TYPE_F32 && (vr.offset_bytes % 4) != 0) return true;
-    if (mask != nullptr && mask->type == GGML_TYPE_F32 && (mr.offset_bytes % 4) != 0) return true;
-    if (mask != nullptr && mask->type == GGML_TYPE_F16 && (mr.offset_bytes % 2) != 0) return true;
 
     if (!ctx_transition(ctx, q, D3D12_RESOURCE_STATE_UNORDERED_ACCESS)) return true;
     if (!ctx_transition(ctx, k, D3D12_RESOURCE_STATE_UNORDERED_ACCESS)) return true;
@@ -190,7 +161,15 @@ inline bool dispatch_attention(dispatch_ctx & ctx, const ggml_tensor * node) {
     D3D12_GPU_DESCRIPTOR_HANDLE uav_table = {};
     const ggml_tensor * mask_for_bind = mask != nullptr ? mask : q;
     const ggml_tensor * uavs[5] = { q, k, v, mask_for_bind, node };
-    if (!ctx_bind_raw_uavs(ctx, uavs, 5, &uav_table)) return true;
+    uint32_t off[5] = { 0, 0, 0, 0, 0 };
+    if (!ctx_bind_raw_uavs_sliding(ctx, uavs, 5, &uav_table, off)) return true;
+    // q (F32) and dst (F32) need 4-byte aligned shader address; k/v depend on
+    // type; mask depends on type.
+    if ((off[0] % 4) != 0 || (off[4] % 4) != 0) return true;
+    if (k->type == GGML_TYPE_F32 && (off[1] % 4) != 0) return true;
+    if (v->type == GGML_TYPE_F32 && (off[2] % 4) != 0) return true;
+    if (mask != nullptr && mask->type == GGML_TYPE_F32 && (off[3] % 4) != 0) return true;
+    if (mask != nullptr && mask->type == GGML_TYPE_F16 && (off[3] % 2) != 0) return true;
 
     ID3D12RootSignature * root_sig = ctx_get_root_sig(ctx, 5, 21);
     if (root_sig == nullptr) return true;
@@ -209,11 +188,11 @@ inline bool dispatch_attention(dispatch_ctx & ctx, const ggml_tensor * node) {
         static_cast<UINT>(nkv),
         static_cast<UINT>(nh),
         static_cast<UINT>(nh_kv),
-        static_cast<UINT>(qr.offset_bytes),
-        static_cast<UINT>(kr.offset_bytes),
-        static_cast<UINT>(vr.offset_bytes),
-        mask != nullptr ? static_cast<UINT>(mr.offset_bytes) : 0u,
-        static_cast<UINT>(dr.offset_bytes),
+        off[0],
+        off[1],
+        off[2],
+        mask != nullptr ? off[3] : 0u,
+        off[4],
         static_cast<UINT>(q->nb[1]),
         static_cast<UINT>(q->nb[2]),
         static_cast<UINT>(k->nb[1]),

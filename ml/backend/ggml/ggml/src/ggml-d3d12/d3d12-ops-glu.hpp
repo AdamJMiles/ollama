@@ -56,16 +56,6 @@ inline bool dispatch_glu(dispatch_ctx & ctx, const ggml_tensor * node) {
         default: return true;
     }
 
-    const tensor_resource sr = ctx_resolve_tensor(ctx, node->src[0]);
-    const tensor_resource dr = ctx_resolve_tensor(ctx, node);
-    if (!sr.valid || !dr.valid) return true;
-
-    tensor_resource gr{};
-    if (split) {
-        gr = ctx_resolve_tensor(ctx, node->src[1]);
-        if (!gr.valid) return true;
-    }
-
     const int64_t count_out_i64 = ggml_nelements(node);
     const int64_t n_out_i64 = node->ne[0];
     if (count_out_i64 <= 0 || n_out_i64 <= 0) return true;
@@ -73,15 +63,7 @@ inline bool dispatch_glu(dispatch_ctx & ctx, const ggml_tensor * node) {
     constexpr uint64_t u32max = 0xFFFFFFFFull;
     if (static_cast<uint64_t>(count_out_i64) > u32max ||
         static_cast<uint64_t>(n_out_i64) > u32max ||
-        (!split && static_cast<uint64_t>(n_out_i64) > (u32max / 2)) ||
-        sr.offset_bytes > u32max ||
-        dr.offset_bytes > u32max ||
-        (split && gr.offset_bytes > u32max)) {
-        return true;
-    }
-    if ((sr.offset_bytes % 4) != 0 ||
-        (dr.offset_bytes % 4) != 0 ||
-        (split && (gr.offset_bytes % 4) != 0)) {
+        (!split && static_cast<uint64_t>(n_out_i64) > (u32max / 2))) {
         return true;
     }
 
@@ -95,21 +77,25 @@ inline bool dispatch_glu(dispatch_ctx & ctx, const ggml_tensor * node) {
     D3D12_GPU_DESCRIPTOR_HANDLE uav_table = {};
     if (split) {
         const ggml_tensor * uavs[3] = { node->src[0], node->src[1], node };
-        if (!ctx_bind_raw_uavs(ctx, uavs, 3, &uav_table)) return true;
+        uint32_t off[3] = { 0, 0, 0 };
+        if (!ctx_bind_raw_uavs_sliding(ctx, uavs, 3, &uav_table, off)) return true;
+        if ((off[0] % 4) != 0 || (off[1] % 4) != 0 || (off[2] % 4) != 0) return true;
         ID3D12RootSignature * rs = ctx_get_root_sig(ctx, 3, 4);
         if (rs == nullptr) return true;
         ID3D12PipelineState * pso = ctx.psos->get(shader, rs, {});
         if (pso == nullptr) return true;
-        const UINT consts[4] = { count_out, static_cast<UINT>(sr.offset_bytes), static_cast<UINT>(gr.offset_bytes), static_cast<UINT>(dr.offset_bytes) };
+        const UINT consts[4] = { count_out, off[0], off[1], off[2] };
         if (!ctx_bind_compute(ctx, pso, rs, uav_table, 3, consts, 4)) return true;
     } else {
         const ggml_tensor * uavs[2] = { node->src[0], node };
-        if (!ctx_bind_raw_uavs(ctx, uavs, 2, &uav_table)) return true;
+        uint32_t off[2] = { 0, 0 };
+        if (!ctx_bind_raw_uavs_sliding(ctx, uavs, 2, &uav_table, off)) return true;
+        if ((off[0] % 4) != 0 || (off[1] % 4) != 0) return true;
         ID3D12RootSignature * rs = ctx_get_root_sig(ctx, 2, 5);
         if (rs == nullptr) return true;
         ID3D12PipelineState * pso = ctx.psos->get(shader, rs, {});
         if (pso == nullptr) return true;
-        const UINT consts[5] = { count_out, n_out, static_cast<UINT>(sr.offset_bytes), static_cast<UINT>(dr.offset_bytes), swapped ? 1u : 0u };
+        const UINT consts[5] = { count_out, n_out, off[0], off[1], swapped ? 1u : 0u };
         if (!ctx_bind_compute(ctx, pso, rs, uav_table, 2, consts, 5)) return true;
     }
 

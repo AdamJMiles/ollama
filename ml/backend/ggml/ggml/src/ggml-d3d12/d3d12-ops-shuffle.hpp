@@ -168,25 +168,18 @@ inline bool dispatch_shuffle(dispatch_ctx & ctx, const ggml_tensor * node) {
     if (!shuffle_u64_fits_u32(count)) return true;
 
     const ggml_tensor * src = node->src[0];
-    const tensor_resource sr = ctx_resolve_tensor(ctx, src);
-    const tensor_resource dr = ctx_resolve_tensor(ctx, node);
-    if (!shuffle_resource_offset_ok(sr) || !shuffle_resource_offset_ok(dr)) return true;
 
     if (!ctx_transition(ctx, src, D3D12_RESOURCE_STATE_UNORDERED_ACCESS)) return true;
     if (!ctx_transition(ctx, node, D3D12_RESOURCE_STATE_UNORDERED_ACCESS)) return true;
 
     if (node->op == GGML_OP_CONT) {
-        const size_t elem_size = ggml_type_size(node->type);
-        if (!shuffle_linear_dense_span_fits_u32(dr.offset_bytes, count, elem_size)) return true;
-        // F16 src may have nb[0] = 2; use the 2-byte aligned span check.
-        const bool src_span_ok = (node->type == GGML_TYPE_F16)
-            ? shuffle_tensor_span_fits_u32_2aligned(sr.offset_bytes, src)
-            : shuffle_tensor_span_fits_u32(sr.offset_bytes, src);
-        if (!src_span_ok) return true;
-
         D3D12_GPU_DESCRIPTOR_HANDLE uav_table = {};
         const ggml_tensor * uavs[2] = { src, node };
-        if (!ctx_bind_raw_uavs(ctx, uavs, 2, &uav_table)) return true;
+        uint32_t off[2] = { 0, 0 };
+        if (!ctx_bind_raw_uavs_sliding(ctx, uavs, 2, &uav_table, off)) return true;
+        // F16 src may have nb[0]=2, so 2-byte alignment is the minimum; F32 needs 4.
+        const size_t src_align = (node->type == GGML_TYPE_F16) ? 2u : 4u;
+        if ((off[0] % src_align) != 0 || (off[1] % src_align) != 0) return true;
 
         ID3D12RootSignature * rs = ctx_get_root_sig(ctx, 2, 11);
         if (rs == nullptr) return true;
@@ -201,8 +194,8 @@ inline bool dispatch_shuffle(dispatch_ctx & ctx, const ggml_tensor * node) {
         // elem_size). This covers both same-shape CONT and CONT-with-reshape.
         const UINT consts[11] = {
             static_cast<UINT>(count),
-            static_cast<UINT>(sr.offset_bytes),
-            static_cast<UINT>(dr.offset_bytes),
+            off[0],
+            off[1],
             static_cast<UINT>(src->ne[0]),
             static_cast<UINT>(src->ne[1]),
             static_cast<UINT>(src->ne[2]),
@@ -221,6 +214,12 @@ inline bool dispatch_shuffle(dispatch_ctx & ctx, const ggml_tensor * node) {
         ctx_uav_barrier(ctx, node);
         return true;
     }
+
+    // REPEAT/PAD/GET_ROWS: keep the original resolve+span-check path for now
+    // (these don't currently hit the > 4 GB pathology with our model).
+    const tensor_resource sr = ctx_resolve_tensor(ctx, src);
+    const tensor_resource dr = ctx_resolve_tensor(ctx, node);
+    if (!shuffle_resource_offset_ok(sr) || !shuffle_resource_offset_ok(dr)) return true;
 
     if (node->op == GGML_OP_REPEAT) {
         if (!shuffle_tensor_span_fits_u32(sr.offset_bytes, src)) return true;

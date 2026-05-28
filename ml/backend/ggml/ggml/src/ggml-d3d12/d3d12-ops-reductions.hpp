@@ -124,26 +124,22 @@ inline bool dispatch_reductions(dispatch_ctx & ctx, const ggml_tensor * node) {
             return true;
     }
 
-    const tensor_resource sr = ctx_resolve_tensor(ctx, src);
-    const tensor_resource dr = ctx_resolve_tensor(ctx, node);
-    if (!sr.valid || !dr.valid) return true;
-
     if (!reductions_fits_u32(reduction_width) || !reductions_fits_u32(dispatch_x) ||
         !reductions_fits_u32(dispatch_y) || !reductions_fits_u32(param1_u64)) {
         return true;
     }
-    if (ggml_nbytes(src) > 0xFFFFFFFFull || ggml_nbytes(node) > 0xFFFFFFFFull ||
-        sr.offset_bytes > 0xFFFFFFFFull || dr.offset_bytes > 0xFFFFFFFFull) {
+    if (ggml_nbytes(src) > 0xFFFFFFFFull || ggml_nbytes(node) > 0xFFFFFFFFull) {
         return true;
     }
-    if ((sr.offset_bytes % 4) != 0 || (dr.offset_bytes % 4) != 0) return true;
 
     if (!ctx_transition(ctx, src, D3D12_RESOURCE_STATE_UNORDERED_ACCESS)) return true;
     if (!ctx_transition(ctx, node, D3D12_RESOURCE_STATE_UNORDERED_ACCESS)) return true;
 
     D3D12_GPU_DESCRIPTOR_HANDLE uav_table = {};
     const ggml_tensor * uavs[2] = { src, node };
-    if (!ctx_bind_raw_uavs(ctx, uavs, 2, &uav_table)) return true;
+    uint32_t off[2] = { 0, 0 };
+    if (!ctx_bind_raw_uavs_sliding(ctx, uavs, 2, &uav_table, off)) return true;
+    if ((off[0] % 4) != 0 || (off[1] % 4) != 0) return true;
 
     ID3D12RootSignature * rs = ctx_get_root_sig(ctx, 2, 5);
     if (rs == nullptr) return true;
@@ -152,8 +148,8 @@ inline bool dispatch_reductions(dispatch_ctx & ctx, const ggml_tensor * node) {
 
     const UINT consts[5] = {
         static_cast<UINT>(reduction_width),
-        static_cast<UINT>(sr.offset_bytes),
-        static_cast<UINT>(dr.offset_bytes),
+        off[0],
+        off[1],
         param0,
         static_cast<UINT>(param1_u64),
     };

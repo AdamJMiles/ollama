@@ -89,22 +89,19 @@ inline bool dispatch_unary(dispatch_ctx & ctx, const ggml_tensor * node) {
         default: return true;
     }
 
-    const tensor_resource src_r = ctx_resolve_tensor(ctx, src);
-    const tensor_resource dst_r = ctx_resolve_tensor(ctx, node);
-    if (!src_r.valid || !dst_r.valid) return true;
-
     const size_t bytes = ggml_nbytes(node);
     if (bytes == 0) return true;
     const size_t count = ggml_nelements(node);
-    if ((src_r.offset_bytes % 4) != 0 || (dst_r.offset_bytes % 4) != 0) return true;
-    if (count > 0xFFFFFFFFull || src_r.offset_bytes > 0xFFFFFFFFull || dst_r.offset_bytes > 0xFFFFFFFFull) return true;
+    if (count > 0xFFFFFFFFull) return true;
 
     if (!ctx_transition(ctx, src, D3D12_RESOURCE_STATE_UNORDERED_ACCESS)) return true;
     if (!ctx_transition(ctx, node, D3D12_RESOURCE_STATE_UNORDERED_ACCESS)) return true;
 
     D3D12_GPU_DESCRIPTOR_HANDLE uav_table = {};
     const ggml_tensor * uavs[2] = { src, node };
-    if (!ctx_bind_raw_uavs(ctx, uavs, 2, &uav_table)) return true;
+    uint32_t off[2] = { 0, 0 };
+    if (!ctx_bind_raw_uavs_sliding(ctx, uavs, 2, &uav_table, off)) return true;
+    if ((off[0] % 4) != 0 || (off[1] % 4) != 0) return true;
 
     ID3D12RootSignature * root_sig = ctx_get_root_sig(ctx, 2, 4);
     if (root_sig == nullptr) return true;
@@ -113,8 +110,8 @@ inline bool dispatch_unary(dispatch_ctx & ctx, const ggml_tensor * node) {
 
     const UINT consts[4] = {
         static_cast<UINT>(count),
-        static_cast<UINT>(src_r.offset_bytes),
-        static_cast<UINT>(dst_r.offset_bytes),
+        off[0],
+        off[1],
         param0,
     };
     if (!ctx_bind_compute(ctx, pso, root_sig, uav_table, 2, consts, 4)) return true;
