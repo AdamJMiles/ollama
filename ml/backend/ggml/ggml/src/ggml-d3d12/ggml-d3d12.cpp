@@ -137,6 +137,16 @@ struct d3d12_device {
     bool compute_ready = false;
     d3d12_caps caps;
 
+    // GPU timestamp profiling (env-gated via GGML_D3D12_PROFILE_GPU=1).
+    // Records start/end timestamps around every Dispatch in graph_compute
+    // so we can attribute GPU wall time to per-op-type buckets. Lazily
+    // initialized on first profiled graph.
+    ComPtr<ID3D12QueryHeap>   ts_query_heap;
+    ComPtr<ID3D12Resource>    ts_readback;
+    void *                    ts_readback_ptr  = nullptr;
+    UINT64                    ts_freq          = 0;
+    UINT                      ts_heap_capacity = 0;
+
     ~d3d12_device() {
         if (upload && upload_ptr) {
             upload->Unmap(0, nullptr);
@@ -149,6 +159,10 @@ struct d3d12_device {
         if (scratch_upload && scratch_upload_ptr) {
             scratch_upload->Unmap(0, nullptr);
             scratch_upload_ptr = nullptr;
+        }
+        if (ts_readback && ts_readback_ptr) {
+            ts_readback->Unmap(0, nullptr);
+            ts_readback_ptr = nullptr;
         }
         if (fence_event != NULL) {
             CloseHandle(fence_event);
@@ -811,6 +825,61 @@ static bool d3d12_end_commands_and_wait_locked(d3d12_device * dev) {
     return ok;
 }
 
+// Lazily create a TIMESTAMP query heap + readback buffer sized for `capacity`
+// queries. Subsequent calls with the same or smaller capacity are no-ops.
+// Returns false on failure (heap or buffer creation, or unmappable readback).
+static bool d3d12_ensure_ts_resources(d3d12_device * dev, UINT capacity) {
+    if (dev->ts_query_heap && dev->ts_heap_capacity >= capacity) {
+        return true;
+    }
+    if (dev->ts_readback && dev->ts_readback_ptr) {
+        dev->ts_readback->Unmap(0, nullptr);
+        dev->ts_readback_ptr = nullptr;
+    }
+    dev->ts_query_heap.Reset();
+    dev->ts_readback.Reset();
+
+    D3D12_QUERY_HEAP_DESC qdesc = {};
+    qdesc.Type     = D3D12_QUERY_HEAP_TYPE_TIMESTAMP;
+    qdesc.Count    = capacity;
+    qdesc.NodeMask = 0;
+    HRESULT hr = dev->device->CreateQueryHeap(&qdesc, IID_PPV_ARGS(&dev->ts_query_heap));
+    if (FAILED(hr)) {
+        d3d12_log_hr("CreateQueryHeap(TIMESTAMP)", hr);
+        return false;
+    }
+
+    const size_t bytes = static_cast<size_t>(capacity) * sizeof(UINT64);
+    D3D12_HEAP_PROPERTIES rb_props = d3d12_heap_properties(D3D12_HEAP_TYPE_READBACK);
+    D3D12_RESOURCE_DESC   rb_desc  = d3d12_buffer_desc(bytes, D3D12_RESOURCE_FLAG_NONE);
+    hr = dev->device->CreateCommittedResource(
+        &rb_props, D3D12_HEAP_FLAG_NONE, &rb_desc,
+        D3D12_RESOURCE_STATE_COPY_DEST, nullptr, IID_PPV_ARGS(&dev->ts_readback));
+    if (FAILED(hr)) {
+        d3d12_log_hr("CreateCommittedResource(ts_readback)", hr);
+        dev->ts_query_heap.Reset();
+        return false;
+    }
+
+    D3D12_RANGE empty = { 0, 0 };
+    hr = dev->ts_readback->Map(0, &empty, &dev->ts_readback_ptr);
+    if (FAILED(hr)) {
+        d3d12_log_hr("Map(ts_readback)", hr);
+        dev->ts_readback.Reset();
+        dev->ts_query_heap.Reset();
+        return false;
+    }
+
+    if (dev->ts_freq == 0) {
+        if (FAILED(dev->queue->GetTimestampFrequency(&dev->ts_freq)) || dev->ts_freq == 0) {
+            // Fall back to a sentinel; per-op us math will report 0.
+            dev->ts_freq = 1;
+        }
+    }
+    dev->ts_heap_capacity = capacity;
+    return true;
+}
+
 static void d3d12_transition(ID3D12GraphicsCommandList * cmd, d3d12_buffer * buffer, D3D12_RESOURCE_STATES after) {
     if (buffer->state == after) {
         return;
@@ -1344,10 +1413,52 @@ void ctx_uav_barrier(dispatch_ctx & ctx, const ggml_tensor * tensor) {
     if (skip) return;
     d3d12_buffer * buf = resolve_buffer(tensor);
     if (buf == nullptr || !buf->resource) return;
+    // Deferred-barrier mode: register the resource for later flush instead
+    // of emitting the barrier now. The graph_compute dispatcher will
+    // call ctx_flush_pending_uav_for_reads() before each op to issue a
+    // single coalesced barrier if any input depends on a pending write.
+    static const bool defer = std::getenv("GGML_D3D12_DEFER_BARRIERS") != nullptr;
+    if (defer) {
+        ctx.pending_uav_writes.insert(buf->resource.Get());
+        return;
+    }
     D3D12_RESOURCE_BARRIER barrier = {};
     barrier.Type        = D3D12_RESOURCE_BARRIER_TYPE_UAV;
     barrier.UAV.pResource = buf->resource.Get();
     ctx.cmd->ResourceBarrier(1, &barrier);
+}
+
+void ctx_flush_pending_uav_for_reads(dispatch_ctx & ctx,
+                                     const ggml_tensor * const * reads,
+                                     size_t count) {
+    if (ctx.cmd == nullptr) return;
+    if (ctx.pending_uav_writes.empty()) return;
+    bool needs_flush = false;
+    for (size_t i = 0; i < count; ++i) {
+        if (reads[i] == nullptr) continue;
+        d3d12_buffer * buf = resolve_buffer(reads[i]);
+        if (buf == nullptr || !buf->resource) continue;
+        if (ctx.pending_uav_writes.find(buf->resource.Get()) != ctx.pending_uav_writes.end()) {
+            needs_flush = true;
+            break;
+        }
+    }
+    if (!needs_flush) return;
+    D3D12_RESOURCE_BARRIER barrier = {};
+    barrier.Type        = D3D12_RESOURCE_BARRIER_TYPE_UAV;
+    barrier.UAV.pResource = nullptr;  // null = sync ALL outstanding UAV writes
+    ctx.cmd->ResourceBarrier(1, &barrier);
+    ctx.pending_uav_writes.clear();
+}
+
+void ctx_flush_all_pending_uav(dispatch_ctx & ctx) {
+    if (ctx.cmd == nullptr) return;
+    if (ctx.pending_uav_writes.empty()) return;
+    D3D12_RESOURCE_BARRIER barrier = {};
+    barrier.Type        = D3D12_RESOURCE_BARRIER_TYPE_UAV;
+    barrier.UAV.pResource = nullptr;
+    ctx.cmd->ResourceBarrier(1, &barrier);
+    ctx.pending_uav_writes.clear();
 }
 
 bool ctx_bind_raw_uavs(dispatch_ctx & ctx,
@@ -1730,8 +1841,39 @@ static enum ggml_status ggml_backend_d3d12_graph_compute(ggml_backend_t backend,
     // GGML_D3D12_PROFILE=1 to attribute remaining decode overhead.
     static const bool profile = std::getenv("GGML_D3D12_PROFILE") != nullptr;
     static const bool profile_ops = std::getenv("GGML_D3D12_PROFILE_OPS") != nullptr;
+    static const bool profile_gpu = std::getenv("GGML_D3D12_PROFILE_GPU") != nullptr;
     const auto record_start = profile ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
     int op_counts[GGML_OP_COUNT] = {0};
+
+    // GPU timestamp infra. Two queries per node (start + end) -> capacity =
+    // 2 * n_nodes. Round up to a power-of-two so we don't re-create the
+    // heap for small graph-size fluctuations.
+    UINT ts_capacity = 0;
+    std::vector<int> ts_node_op; // op type at queries [2i, 2i+1]
+    struct mm_key {
+        int     s0_type;
+        int     s1_type;
+        int64_t K;
+        int64_t M;
+        int64_t N;
+        bool operator==(const mm_key & o) const {
+            return s0_type==o.s0_type && s1_type==o.s1_type && K==o.K && M==o.M && N==o.N;
+        }
+    };
+    std::vector<mm_key> ts_node_mm_keys; // parallel to ts_node_op; non-MUL_MAT entries have type=-1
+    bool ts_enabled = false;
+    if (profile_gpu && cgraph->n_nodes > 0) {
+        UINT cap = static_cast<UINT>(cgraph->n_nodes) * 2u;
+        UINT pow2 = 64;
+        while (pow2 < cap && pow2 < (1u << 20)) pow2 <<= 1;
+        if (d3d12_ensure_ts_resources(dev, pow2)) {
+            ts_capacity = pow2;
+            ts_enabled = true;
+            ts_node_op.reserve(cgraph->n_nodes);
+            ts_node_mm_keys.reserve(cgraph->n_nodes);
+        }
+    }
+    UINT ts_used = 0; // pairs used
 
     for (int i = 0; i < cgraph->n_nodes; ++i) {
         ggml_tensor * node = cgraph->nodes[i];
@@ -1753,6 +1895,19 @@ static enum ggml_status ggml_backend_d3d12_graph_compute(ggml_backend_t backend,
             op_counts[node->op]++;
         }
 
+        // Deferred-barrier mode: emit a coalesced UAV barrier before this
+        // op only if any input depends on a write that hasn't been flushed
+        // yet. Fast-path no-op when GGML_D3D12_DEFER_BARRIERS is off
+        // (pending_uav_writes is always empty in that case).
+        if (!dctx.pending_uav_writes.empty()) {
+            const ggml_tensor * reads[GGML_MAX_SRC];
+            size_t n_reads = 0;
+            for (int s = 0; s < GGML_MAX_SRC; ++s) {
+                if (node->src[s] != nullptr) reads[n_reads++] = node->src[s];
+            }
+            ggml_d3d12::ctx_flush_pending_uav_for_reads(dctx, reads, n_reads);
+        }
+
         // Debug: dump every op we process. Enable with GGML_D3D12_LOG_OPS=1.
         if (log_ops) {
             const ggml_tensor * s0 = node->src[0];
@@ -1769,6 +1924,14 @@ static enum ggml_status ggml_backend_d3d12_graph_compute(ggml_backend_t backend,
         // Each handler returns true if it claimed the op (whether it
         // succeeded or logged a failure). New Phase 5 op groups append
         // their dispatch_<cat> call here.
+        const UINT ts_pair = ts_enabled ? ts_used : 0;
+        if (ts_enabled && (ts_pair * 2u + 1u) < ts_capacity) {
+            dev->cmd->EndQuery(dev->ts_query_heap.Get(), D3D12_QUERY_TYPE_TIMESTAMP, ts_pair * 2u);
+        } else if (ts_enabled) {
+            // capacity exhausted - disable for the rest of this graph
+            ts_enabled = false;
+        }
+
         bool handled = false;
         if (!handled && ggml_d3d12::dispatch_memops(dctx, node))     handled = true;
         if (!handled && ggml_d3d12::dispatch_unary(dctx, node))      handled = true;
@@ -1787,6 +1950,23 @@ static enum ggml_status ggml_backend_d3d12_graph_compute(ggml_backend_t backend,
         if (!handled && ggml_d3d12::dispatch_mulmatvec(dctx, node))  handled = true;
         // === end op dispatchers ===
 
+        if (ts_enabled) {
+            dev->cmd->EndQuery(dev->ts_query_heap.Get(), D3D12_QUERY_TYPE_TIMESTAMP, ts_pair * 2u + 1u);
+            ts_node_op.push_back(static_cast<int>(node->op));
+            mm_key k;
+            if (node->op == GGML_OP_MUL_MAT && node->src[0] != nullptr && node->src[1] != nullptr) {
+                k.s0_type = (int)node->src[0]->type;
+                k.s1_type = (int)node->src[1]->type;
+                k.K = node->src[0]->ne[0];
+                k.M = node->src[0]->ne[1];
+                k.N = node->src[1]->ne[1] * node->src[1]->ne[2] * node->src[1]->ne[3];
+            } else {
+                k.s0_type = -1; k.s1_type = -1; k.K = 0; k.M = 0; k.N = 0;
+            }
+            ts_node_mm_keys.push_back(k);
+            ts_used++;
+        }
+
         if (!handled) {
             GGML_LOG_ERROR("ggml_d3d12: unsupported op %s in graph_compute\n", ggml_op_name(node->op));
             return GGML_STATUS_FAILED;
@@ -1794,6 +1974,18 @@ static enum ggml_status ggml_backend_d3d12_graph_compute(ggml_backend_t backend,
     }
 
     const auto record_end = profile ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
+    // Flush any remaining pending UAV writes before submission. Required
+    // for deferred-barrier mode so all writes are visible to subsequent
+    // graph executions or readback. No-op when DEFER_BARRIERS is off.
+    ggml_d3d12::ctx_flush_all_pending_uav(dctx);
+    // Resolve timestamp queries into the readback buffer. Must happen
+    // before Close()/Execute. ResolveQueryData copies the GPU-internal
+    // timestamp data into a normal buffer we can map for CPU read.
+    if (ts_enabled && ts_used > 0) {
+        dev->cmd->ResolveQueryData(dev->ts_query_heap.Get(),
+            D3D12_QUERY_TYPE_TIMESTAMP, 0, ts_used * 2u,
+            dev->ts_readback.Get(), 0);
+    }
     if (!d3d12_end_commands_and_wait_locked(dev)) {
         return GGML_STATUS_FAILED;
     }
@@ -1819,6 +2011,70 @@ static enum ggml_status ggml_backend_d3d12_graph_compute(ggml_backend_t backend,
             }
         }
         GGML_LOG_INFO("ggml_d3d12: graph ops:%s\n", buf.c_str());
+    }
+    if (profile_gpu && ts_used > 0 && dev->ts_readback_ptr && dev->ts_freq > 0) {
+        const UINT64 * ts = static_cast<const UINT64 *>(dev->ts_readback_ptr);
+        // Per-op-type aggregation across this graph
+        double op_ms[GGML_OP_COUNT] = {0};
+        int    op_n [GGML_OP_COUNT] = {0};
+        double total_ms = 0.0;
+        const double tick_to_ms = 1000.0 / static_cast<double>(dev->ts_freq);
+
+        // Per-MUL_MAT shape aggregation (key declared at outer scope so it's
+        // visible to both the push_back above and the lookup below).
+        struct mm_val { double ms; int n; };
+        std::vector<std::pair<mm_key, mm_val>> mm_rows;
+
+        for (UINT i = 0; i < ts_used; ++i) {
+            const UINT64 a = ts[i * 2u];
+            const UINT64 b = ts[i * 2u + 1u];
+            if (b <= a) continue;
+            const double dt_ms = static_cast<double>(b - a) * tick_to_ms;
+            const int op = ts_node_op[i];
+            if (op >= 0 && op < GGML_OP_COUNT) {
+                op_ms[op] += dt_ms;
+                op_n [op] += 1;
+                total_ms  += dt_ms;
+            }
+            if (op == GGML_OP_MUL_MAT && i < ts_node_mm_keys.size()) {
+                const mm_key & k = ts_node_mm_keys[i];
+                bool found = false;
+                for (auto & r : mm_rows) {
+                    if (r.first == k) { r.second.ms += dt_ms; r.second.n += 1; found = true; break; }
+                }
+                if (!found) mm_rows.push_back({k, {dt_ms, 1}});
+            }
+        }
+        // Print top ops by total GPU time, sorted descending.
+        struct entry { int op; double ms; int n; };
+        std::vector<entry> rows;
+        rows.reserve(GGML_OP_COUNT);
+        for (int op = 0; op < GGML_OP_COUNT; ++op) {
+            if (op_n[op] > 0) rows.push_back({op, op_ms[op], op_n[op]});
+        }
+        std::sort(rows.begin(), rows.end(), [](const entry & a, const entry & b){ return a.ms > b.ms; });
+        std::string buf;
+        buf.reserve(256);
+        for (const entry & e : rows) {
+            char tmp[96];
+            snprintf(tmp, sizeof(tmp), " %s=%.2fms[n=%d,%.1fus/op]",
+                ggml_op_name((ggml_op)e.op), e.ms, e.n,
+                (e.ms * 1000.0) / static_cast<double>(e.n));
+            buf += tmp;
+        }
+        GGML_LOG_INFO("ggml_d3d12: gpu total=%.2fms ops:%s\n", total_ms, buf.c_str());
+
+        // Detailed MUL_MAT breakdown by shape, sorted by total ms desc.
+        std::sort(mm_rows.begin(), mm_rows.end(),
+            [](const auto & a, const auto & b){ return a.second.ms > b.second.ms; });
+        for (const auto & r : mm_rows) {
+            GGML_LOG_INFO("ggml_d3d12: mm s0=%s s1=%s K=%lld M=%lld N=%lld n=%d total=%.2fms (%.1fus/op)\n",
+                ggml_type_name((ggml_type)r.first.s0_type),
+                ggml_type_name((ggml_type)r.first.s1_type),
+                (long long)r.first.K, (long long)r.first.M, (long long)r.first.N,
+                r.second.n, r.second.ms,
+                (r.second.ms * 1000.0) / static_cast<double>(r.second.n));
+        }
     }
 
     return GGML_STATUS_SUCCESS;
