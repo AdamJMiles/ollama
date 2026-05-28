@@ -20,6 +20,23 @@ inline bool dequant_is_legacy_quant_type(ggml_type type) {
     }
 }
 
+inline bool dequant_is_kquant_type(ggml_type type) {
+    switch (type) {
+        case GGML_TYPE_Q2_K:
+        case GGML_TYPE_Q3_K:
+        case GGML_TYPE_Q4_K:
+        case GGML_TYPE_Q5_K:
+        case GGML_TYPE_Q6_K:
+            return true;
+        default:
+            return false;
+    }
+}
+
+inline bool dequant_is_supported_quant_type(ggml_type type) {
+    return dequant_is_legacy_quant_type(type) || dequant_is_kquant_type(type);
+}
+
 inline const char * dequant_shader_name(ggml_type type) {
     switch (type) {
         case GGML_TYPE_Q4_0: return "get_rows_q4_0";
@@ -27,6 +44,11 @@ inline const char * dequant_shader_name(ggml_type type) {
         case GGML_TYPE_Q5_0: return "get_rows_q5_0";
         case GGML_TYPE_Q5_1: return "get_rows_q5_1";
         case GGML_TYPE_Q8_0: return "get_rows_q8_0";
+        case GGML_TYPE_Q2_K: return "get_rows_q2_K";
+        case GGML_TYPE_Q3_K: return "get_rows_q3_K";
+        case GGML_TYPE_Q4_K: return "get_rows_q4_K";
+        case GGML_TYPE_Q5_K: return "get_rows_q5_K";
+        case GGML_TYPE_Q6_K: return "get_rows_q6_K";
         default: return nullptr;
     }
 }
@@ -35,7 +57,7 @@ inline bool supports_op_dequant(const ggml_tensor * op) {
     if (op == nullptr || op->src[0] == nullptr) return false;
 
     const ggml_tensor * src0 = op->src[0];
-    if (!dequant_is_legacy_quant_type(src0->type)) return false;
+    if (!dequant_is_supported_quant_type(src0->type)) return false;
     if (op->type != GGML_TYPE_F32) return false;
     if (!ggml_is_contiguous(src0) || !ggml_is_contiguous(op)) return false;
     if (src0->ne[0] <= 0 || (src0->ne[0] % ggml_blck_size(src0->type)) != 0) return false;

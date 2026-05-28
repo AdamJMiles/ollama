@@ -37,6 +37,7 @@
 #include "d3d12-ops-memops.hpp"
 #include "d3d12-ops-unary.hpp"
 #include "d3d12-ops-binary.hpp"
+#include "d3d12-ops-mulmm.hpp"
 #include "d3d12-ops-reductions.hpp"
 #include "d3d12-ops-softmax.hpp"
 #include "d3d12-ops-glu.hpp"
@@ -44,7 +45,10 @@
 #include "d3d12-ops-shuffle.hpp"
 #include "d3d12-ops-rope.hpp"
 #include "d3d12-ops-conv.hpp"
+#include "d3d12-ops-ssm.hpp"
 #include "d3d12-ops-dequant.hpp"
+#include "d3d12-ops-attention.hpp"
+#include "d3d12-ops-mulmatvec.hpp"
 
 #ifndef GGML_D3D12_HAS_SHADERS
 #if __has_include("ggml-d3d12-shaders.hpp")
@@ -1162,6 +1166,7 @@ static enum ggml_status ggml_backend_d3d12_graph_compute(ggml_backend_t backend,
         if (!handled && ggml_d3d12::dispatch_memops(dctx, node))     handled = true;
         if (!handled && ggml_d3d12::dispatch_unary(dctx, node))      handled = true;
         if (!handled && ggml_d3d12::dispatch_binary(dctx, node))     handled = true;
+        if (!handled && ggml_d3d12::dispatch_mulmm(dctx, node))      handled = true;
         if (!handled && ggml_d3d12::dispatch_reductions(dctx, node)) handled = true;
         if (!handled && ggml_d3d12::dispatch_softmax(dctx, node))    handled = true;
         if (!handled && ggml_d3d12::dispatch_glu(dctx, node))        handled = true;
@@ -1169,7 +1174,10 @@ static enum ggml_status ggml_backend_d3d12_graph_compute(ggml_backend_t backend,
         if (!handled && ggml_d3d12::dispatch_shuffle(dctx, node))    handled = true;
         if (!handled && ggml_d3d12::dispatch_rope(dctx, node))       handled = true;
         if (!handled && ggml_d3d12::dispatch_conv(dctx, node))       handled = true;
+        if (!handled && ggml_d3d12::dispatch_ssm(dctx, node))        handled = true;
         if (!handled && ggml_d3d12::dispatch_dequant(dctx, node))    handled = true;
+        if (!handled && ggml_d3d12::dispatch_attention(dctx, node))  handled = true;
+        if (!handled && ggml_d3d12::dispatch_mulmatvec(dctx, node))  handled = true;
         // === end op dispatchers ===
 
         if (!handled) {
@@ -1380,6 +1388,7 @@ static bool ggml_backend_d3d12_device_supports_op(ggml_backend_dev_t dev, const 
     if (ggml_d3d12::supports_op_memops(op))     return true;
     if (ggml_d3d12::supports_op_unary(op))      return true;
     if (ggml_d3d12::supports_op_binary(op))     return true;
+    if (ggml_d3d12::supports_op_mulmm(op))      return true;
     if (ggml_d3d12::supports_op_reductions(op)) return true;
     if (ggml_d3d12::supports_op_softmax(op))    return true;
     if (ggml_d3d12::supports_op_glu(op))        return true;
@@ -1387,7 +1396,10 @@ static bool ggml_backend_d3d12_device_supports_op(ggml_backend_dev_t dev, const 
     if (ggml_d3d12::supports_op_shuffle(op))    return true;
     if (ggml_d3d12::supports_op_rope(op))       return true;
     if (ggml_d3d12::supports_op_conv(op))       return true;
+    if (ggml_d3d12::supports_op_ssm(op))        return true;
     if (ggml_d3d12::supports_op_dequant(op))    return true;
+    if (ggml_d3d12::supports_op_attention(op))  return true;
+    if (ggml_d3d12::supports_op_mulmatvec(op))  return true;
     // === end op support checks ===
 
     return false;
