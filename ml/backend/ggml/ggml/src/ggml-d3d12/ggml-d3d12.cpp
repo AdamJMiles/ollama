@@ -37,6 +37,10 @@
 #include "d3d12-ops-memops.hpp"
 #include "d3d12-ops-unary.hpp"
 #include "d3d12-ops-binary.hpp"
+#include "d3d12-ops-reductions.hpp"
+#include "d3d12-ops-softmax.hpp"
+#include "d3d12-ops-glu.hpp"
+#include "d3d12-ops-misc.hpp"
 
 #ifndef GGML_D3D12_HAS_SHADERS
 #if __has_include("ggml-d3d12-shaders.hpp")
@@ -1094,6 +1098,11 @@ void ctx_dispatch_1d(dispatch_ctx & ctx, UINT threads, UINT threads_per_group) {
     ctx.cmd->Dispatch(groups, 1, 1);
 }
 
+void ctx_dispatch_groups(dispatch_ctx & ctx, UINT gx, UINT gy, UINT gz) {
+    if (ctx.cmd == nullptr || gx == 0 || gy == 0 || gz == 0) return;
+    ctx.cmd->Dispatch(gx, gy, gz);
+}
+
 } // namespace ggml_d3d12
 
 static enum ggml_status ggml_backend_d3d12_graph_compute(ggml_backend_t backend, struct ggml_cgraph * cgraph, int batch_size) {
@@ -1146,9 +1155,13 @@ static enum ggml_status ggml_backend_d3d12_graph_compute(ggml_backend_t backend,
         // succeeded or logged a failure). New Phase 5 op groups append
         // their dispatch_<cat> call here.
         bool handled = false;
-        if (!handled && ggml_d3d12::dispatch_memops(dctx, node)) handled = true;
-        if (!handled && ggml_d3d12::dispatch_unary(dctx, node))  handled = true;
-        if (!handled && ggml_d3d12::dispatch_binary(dctx, node)) handled = true;
+        if (!handled && ggml_d3d12::dispatch_memops(dctx, node))     handled = true;
+        if (!handled && ggml_d3d12::dispatch_unary(dctx, node))      handled = true;
+        if (!handled && ggml_d3d12::dispatch_binary(dctx, node))     handled = true;
+        if (!handled && ggml_d3d12::dispatch_reductions(dctx, node)) handled = true;
+        if (!handled && ggml_d3d12::dispatch_softmax(dctx, node))    handled = true;
+        if (!handled && ggml_d3d12::dispatch_glu(dctx, node))        handled = true;
+        if (!handled && ggml_d3d12::dispatch_misc(dctx, node))       handled = true;
         // === end op dispatchers ===
 
         if (!handled) {
@@ -1356,9 +1369,13 @@ static bool ggml_backend_d3d12_device_supports_op(ggml_backend_dev_t dev, const 
 
     // === op support checks (one per category) ===
     // New Phase 5 op groups append their supports_op_<cat> call here.
-    if (ggml_d3d12::supports_op_memops(op)) return true;
-    if (ggml_d3d12::supports_op_unary(op))  return true;
-    if (ggml_d3d12::supports_op_binary(op)) return true;
+    if (ggml_d3d12::supports_op_memops(op))     return true;
+    if (ggml_d3d12::supports_op_unary(op))      return true;
+    if (ggml_d3d12::supports_op_binary(op))     return true;
+    if (ggml_d3d12::supports_op_reductions(op)) return true;
+    if (ggml_d3d12::supports_op_softmax(op))    return true;
+    if (ggml_d3d12::supports_op_glu(op))        return true;
+    if (ggml_d3d12::supports_op_misc(op))       return true;
     // === end op support checks ===
 
     return false;

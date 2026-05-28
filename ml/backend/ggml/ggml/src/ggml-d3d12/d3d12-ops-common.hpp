@@ -102,6 +102,10 @@ bool ctx_bind_compute(dispatch_ctx & ctx,
 // 1D thread dispatch. Issues ceil(threads / threads_per_group) groups along x.
 void ctx_dispatch_1d(dispatch_ctx & ctx, UINT threads, UINT threads_per_group);
 
+// Direct group-count dispatch. Use when the handler already knows the number
+// of workgroups (e.g. one workgroup per output row for reductions/softmax).
+void ctx_dispatch_groups(dispatch_ctx & ctx, UINT gx, UINT gy = 1, UINT gz = 1);
+
 // Tracks the per-graph-compute resource state on the device's underlying
 // d3d12_buffer objects. This is called once at the start of graph_compute
 // so that ctx_transition can know the current state.
