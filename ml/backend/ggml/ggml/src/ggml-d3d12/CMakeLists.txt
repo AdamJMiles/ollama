@@ -44,6 +44,22 @@ ggml_add_backend_library(ggml-d3d12
                          ../../include/ggml-d3d12.h
                         )
 
+# Output the built DLL into a `d3d12/` subdirectory of the runtime lib path
+# rather than the shared root. The Go-side discovery (runner.go) treats this
+# subdirectory as a filterable library and skips loading it unless
+# OLLAMA_D3D12=1 is set. Leaving the DLL alongside ggml.dll / ggml-cpu-*.dll
+# would cause it to be loaded unconditionally by every runner subprocess and
+# its host buffer type (UPLOAD-heap, write-combined CPU memory) would be
+# picked by the scheduler for "host buffer" allocations, breaking CPU reads.
+set_target_properties(ggml-d3d12 PROPERTIES
+    RUNTIME_OUTPUT_DIRECTORY         "${OLLAMA_BUILD_DIR}/d3d12"
+    RUNTIME_OUTPUT_DIRECTORY_DEBUG   "${OLLAMA_BUILD_DIR}/d3d12"
+    RUNTIME_OUTPUT_DIRECTORY_RELEASE "${OLLAMA_BUILD_DIR}/d3d12"
+    LIBRARY_OUTPUT_DIRECTORY         "${OLLAMA_BUILD_DIR}/d3d12"
+    LIBRARY_OUTPUT_DIRECTORY_DEBUG   "${OLLAMA_BUILD_DIR}/d3d12"
+    LIBRARY_OUTPUT_DIRECTORY_RELEASE "${OLLAMA_BUILD_DIR}/d3d12"
+)
+
 add_dependencies(ggml-d3d12 d3d12-shaders)
 target_include_directories(ggml-d3d12 PRIVATE ${CMAKE_CURRENT_BINARY_DIR})
 

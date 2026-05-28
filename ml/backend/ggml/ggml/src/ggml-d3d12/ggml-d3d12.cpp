@@ -7,7 +7,9 @@
 
 #include <windows.h>
 #include <d3d12.h>
+#include <d3d12sdklayers.h>
 #include <dxgi1_6.h>
+#include <dxgidebug.h>
 #include <wrl/client.h>
 #include <dxcapi.h>
 
@@ -18,6 +20,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <limits>
+#include <malloc.h>
 #include <memory>
 #include <mutex>
 #include <new>
@@ -25,6 +28,7 @@
 #include <vector>
 
 #include "ggml-backend-impl.h"
+#include "ggml-backend.h"
 #include "ggml-d3d12.h"
 #include "ggml-impl.h"
 
@@ -110,6 +114,20 @@ struct d3d12_device {
     ComPtr<ID3D12Resource> readback;
     void * readback_ptr = nullptr;
     size_t readback_size = 0;
+    ComPtr<ID3D12InfoQueue> info_queue;
+    DWORD                   info_callback_cookie = 0;
+    // Per-graph transfer scratch: used to stage tensor inputs that live on
+    // a non-DEFAULT-heap D3D12 buffer (UPLOAD heap host buffer, or CPU
+    // backend buffer) into a UAV-capable DEFAULT heap buffer for compute
+    // shaders to read. Both buffers are bump-allocated within a graph and
+    // reset at graph end. The DEFAULT heap buffer's state is tracked here.
+    ComPtr<ID3D12Resource> scratch_upload;
+    void *                 scratch_upload_ptr      = nullptr;
+    size_t                 scratch_upload_capacity = 0;
+    ComPtr<ID3D12Resource> scratch_dev;
+    size_t                 scratch_dev_capacity    = 0;
+    D3D12_RESOURCE_STATES  scratch_dev_state       = D3D12_RESOURCE_STATE_UNORDERED_ACCESS;
+    size_t                 scratch_offset          = 0;
     d3d12_buffer_type_context buffer_type_context;
     ggml_backend_buffer_type buffer_type = {};
     ggml_d3d12::desc_heap_ring uav_heap;
@@ -126,6 +144,10 @@ struct d3d12_device {
         if (readback && readback_ptr) {
             readback->Unmap(0, nullptr);
             readback_ptr = nullptr;
+        }
+        if (scratch_upload && scratch_upload_ptr) {
+            scratch_upload->Unmap(0, nullptr);
+            scratch_upload_ptr = nullptr;
         }
         if (fence_event != NULL) {
             CloseHandle(fence_event);
@@ -168,6 +190,7 @@ static bool ggml_backend_d3d12_buffer_type_is_host(ggml_backend_buffer_type_t bu
 static const char * ggml_backend_d3d12_host_buffer_type_get_name(ggml_backend_buffer_type_t buft);
 static ggml_backend_buffer_t ggml_backend_d3d12_host_buffer_type_alloc_buffer(ggml_backend_buffer_type_t buft, size_t size);
 static bool ggml_backend_d3d12_host_buffer_type_is_host(ggml_backend_buffer_type_t buft);
+static void ggml_backend_d3d12_host_buffer_free_buffer(ggml_backend_buffer_t buffer);
 
 static void ggml_backend_d3d12_buffer_free_buffer(ggml_backend_buffer_t buffer);
 static void * ggml_backend_d3d12_buffer_get_base(ggml_backend_buffer_t buffer);
@@ -385,6 +408,46 @@ static void d3d12_setup_buffer_type(d3d12_device * dev) {
     };
 }
 
+static bool d3d12_debug_enabled() {
+    static bool checked = false;
+    static bool enabled = false;
+    if (!checked) {
+        const char * env = std::getenv("GGML_D3D12_DEBUG");
+        enabled = (env != nullptr && env[0] != '\0' && env[0] != '0');
+        checked = true;
+    }
+    return enabled;
+}
+
+static bool d3d12_gbv_enabled() {
+    // GPU-based validation: extra slow, opt-in separately.
+    const char * env = std::getenv("GGML_D3D12_GBV");
+    return env != nullptr && env[0] != '\0' && env[0] != '0';
+}
+
+static void d3d12_drain_info_queue(ID3D12InfoQueue * iq) {
+    if (iq == nullptr) return;
+    const UINT64 n = iq->GetNumStoredMessages();
+    for (UINT64 i = 0; i < n; ++i) {
+        SIZE_T size = 0;
+        if (FAILED(iq->GetMessage(i, nullptr, &size)) || size == 0) continue;
+        std::vector<uint8_t> buf(size);
+        D3D12_MESSAGE * m = reinterpret_cast<D3D12_MESSAGE *>(buf.data());
+        if (FAILED(iq->GetMessage(i, m, &size))) continue;
+        const char * sev = "INFO";
+        switch (m->Severity) {
+            case D3D12_MESSAGE_SEVERITY_CORRUPTION: sev = "CORRUPTION"; break;
+            case D3D12_MESSAGE_SEVERITY_ERROR:      sev = "ERROR";      break;
+            case D3D12_MESSAGE_SEVERITY_WARNING:    sev = "WARNING";    break;
+            case D3D12_MESSAGE_SEVERITY_INFO:       sev = "INFO";       break;
+            case D3D12_MESSAGE_SEVERITY_MESSAGE:    sev = "MESSAGE";    break;
+        }
+        GGML_LOG_INFO("ggml_d3d12: D3D12[%s id=%d cat=%d]: %s\n",
+                      sev, (int)m->ID, (int)m->Category, m->pDescription ? m->pDescription : "");
+    }
+    iq->ClearStoredMessages();
+}
+
 static bool d3d12_instance_init() {
     std::lock_guard<std::mutex> lock(g_d3d12.mutex);
     if (g_d3d12.initialized) {
@@ -392,7 +455,30 @@ static bool d3d12_instance_init() {
     }
     g_d3d12.initialized = true;
 
-    HRESULT hr = CreateDXGIFactory2(0, IID_PPV_ARGS(&g_d3d12.factory));
+    UINT factory_flags = 0;
+    if (d3d12_debug_enabled()) {
+        // Enable the D3D12 debug layer (and optionally GPU-based validation)
+        // BEFORE creating any device. This is opt-in via GGML_D3D12_DEBUG=1
+        // because it requires the "Graphics Tools" optional Windows feature
+        // and significantly slows execution.
+        ComPtr<ID3D12Debug> debug;
+        if (SUCCEEDED(D3D12GetDebugInterface(IID_PPV_ARGS(&debug)))) {
+            debug->EnableDebugLayer();
+            GGML_LOG_INFO("ggml_d3d12: D3D12 debug layer enabled\n");
+            if (d3d12_gbv_enabled()) {
+                ComPtr<ID3D12Debug1> debug1;
+                if (SUCCEEDED(debug.As(&debug1))) {
+                    debug1->SetEnableGPUBasedValidation(TRUE);
+                    GGML_LOG_INFO("ggml_d3d12: GPU-based validation enabled\n");
+                }
+            }
+        } else {
+            GGML_LOG_INFO("ggml_d3d12: D3D12GetDebugInterface failed; install 'Graphics Tools' optional feature to enable the debug layer\n");
+        }
+        factory_flags |= DXGI_CREATE_FACTORY_DEBUG;
+    }
+
+    HRESULT hr = CreateDXGIFactory2(factory_flags, IID_PPV_ARGS(&g_d3d12.factory));
     if (FAILED(hr)) {
         d3d12_log_hr("CreateDXGIFactory2", hr);
         return false;
@@ -521,6 +607,30 @@ static bool d3d12_device_ensure(d3d12_device * dev) {
         d3d12_log_hr("D3D12CreateDevice", hr);
         d3d12_release_runtime(dev);
         return false;
+    }
+
+    // Hook up the InfoQueue when the debug layer is enabled. This lets us
+    // surface CORRUPTION/ERROR/WARNING messages from the runtime (e.g. bad
+    // resource state transitions, invalid bindings, leaks). We pull messages
+    // explicitly via d3d12_drain_info_queue at well-defined sync points.
+    if (d3d12_debug_enabled()) {
+        if (SUCCEEDED(dev->device->QueryInterface(IID_PPV_ARGS(&dev->info_queue)))) {
+            dev->info_queue->SetBreakOnSeverity(D3D12_MESSAGE_SEVERITY_CORRUPTION, FALSE);
+            dev->info_queue->SetBreakOnSeverity(D3D12_MESSAGE_SEVERITY_ERROR,      FALSE);
+            // Filter out the noisiest categories (state-creation / execution
+            // info) so the log focuses on actionable issues.
+            D3D12_MESSAGE_SEVERITY deny_sev[] = {
+                D3D12_MESSAGE_SEVERITY_INFO,
+                D3D12_MESSAGE_SEVERITY_MESSAGE,
+            };
+            D3D12_INFO_QUEUE_FILTER filter = {};
+            filter.DenyList.NumSeverities = _countof(deny_sev);
+            filter.DenyList.pSeverityList = deny_sev;
+            dev->info_queue->PushStorageFilter(&filter);
+            GGML_LOG_INFO("ggml_d3d12: InfoQueue hooked for %s\n", dev->name.c_str());
+        } else {
+            GGML_LOG_INFO("ggml_d3d12: InfoQueue not available (debug layer not active)\n");
+        }
     }
 
     // === Query device capabilities for perf-tuning fast paths ===
@@ -685,12 +795,15 @@ static bool d3d12_end_commands_and_wait_locked(d3d12_device * dev) {
     HRESULT hr = dev->cmd->Close();
     if (FAILED(hr)) {
         d3d12_log_hr("ID3D12GraphicsCommandList::Close", hr);
+        if (dev->info_queue) d3d12_drain_info_queue(dev->info_queue.Get());
         return false;
     }
 
     ID3D12CommandList * lists[] = { dev->cmd.Get() };
     dev->queue->ExecuteCommandLists(1, lists);
-    return d3d12_signal_and_wait_locked(dev);
+    const bool ok = d3d12_signal_and_wait_locked(dev);
+    if (dev->info_queue) d3d12_drain_info_queue(dev->info_queue.Get());
+    return ok;
 }
 
 static void d3d12_transition(ID3D12GraphicsCommandList * cmd, d3d12_buffer * buffer, D3D12_RESOURCE_STATES after) {
@@ -888,41 +1001,59 @@ static const char * ggml_backend_d3d12_host_buffer_type_get_name(ggml_backend_bu
     return GGML_D3D12_NAME "_Host";
 }
 
+static void ggml_backend_d3d12_host_buffer_free_buffer(ggml_backend_buffer_t buffer) {
+    if (buffer == nullptr) return;
+    // We allocated this via _aligned_malloc / posix_memalign in
+    // host_buffer_type_alloc_buffer, wrapping it with
+    // ggml_backend_cpu_buffer_from_ptr. Free the raw allocation now (we own
+    // it; the CPU buffer wrapper doesn't free pointers passed via _from_ptr).
+    if (buffer->context != nullptr) {
+#ifdef _WIN32
+        _aligned_free(buffer->context);
+#else
+        free(buffer->context);
+#endif
+        buffer->context = nullptr;
+    }
+}
+
 static ggml_backend_buffer_t ggml_backend_d3d12_host_buffer_type_alloc_buffer(ggml_backend_buffer_type_t buft, size_t size) {
-    d3d12_device * dev = d3d12_get_device(0);
-    if (!d3d12_device_ensure(dev)) {
+    // D3D12 UPLOAD-heap resources sit in write-combined memory: CPU writes
+    // are coalesced but CPU reads are uncached and effectively undefined for
+    // host-buffer semantics, which require plain memcpy in both directions
+    // (the scheduler / CPU backend ops will read from this buffer). We
+    // therefore allocate ordinary heap memory and wrap it as a CPU buffer
+    // (mirroring ggml-vulkan's approach). The buffer type identity is
+    // preserved so the device still owns its host-buffer type and we can
+    // later layer GPU pinning on top if needed.
+    GGML_UNUSED(buft);
+    // Align the underlying allocation to D3D12_BUFFER_ALIGNMENT (256) so the
+    // pointer satisfies the alignment we report through get_alignment().
+    // Otherwise ggml_tallocr_new skips up to alignment-1 bytes via
+    // aligned_offset(base, 0, alignment), and the buffer ends up too small
+    // for the tensor it was sized to hold.
+    void * ptr = nullptr;
+#ifdef _WIN32
+    ptr = _aligned_malloc(size, D3D12_BUFFER_ALIGNMENT);
+#else
+    if (posix_memalign(&ptr, D3D12_BUFFER_ALIGNMENT, size) != 0) ptr = nullptr;
+#endif
+    if (ptr == nullptr) {
+        GGML_LOG_ERROR("ggml_d3d12: host buffer aligned_alloc(%zu) failed\n", size);
         return nullptr;
     }
-
-    d3d12_buffer * buffer_ctx = new (std::nothrow) d3d12_buffer();
-    if (buffer_ctx == nullptr) {
+    ggml_backend_buffer_t buffer = ggml_backend_cpu_buffer_from_ptr(ptr, size);
+    if (buffer == nullptr) {
+#ifdef _WIN32
+        _aligned_free(ptr);
+#else
+        free(ptr);
+#endif
         return nullptr;
     }
-    buffer_ctx->dev = dev;
-    buffer_ctx->size = size;
-    buffer_ctx->host = true;
-    buffer_ctx->state = D3D12_RESOURCE_STATE_GENERIC_READ;
-
-    D3D12_HEAP_PROPERTIES heap_props = d3d12_heap_properties(D3D12_HEAP_TYPE_UPLOAD);
-    D3D12_RESOURCE_DESC desc = d3d12_buffer_desc(size, D3D12_RESOURCE_FLAG_NONE);
-    HRESULT hr = dev->device->CreateCommittedResource(
-        &heap_props, D3D12_HEAP_FLAG_NONE, &desc, D3D12_RESOURCE_STATE_GENERIC_READ, nullptr, IID_PPV_ARGS(&buffer_ctx->resource));
-    if (FAILED(hr)) {
-        d3d12_log_hr("CreateCommittedResource(host upload)", hr);
-        delete buffer_ctx;
-        return nullptr;
-    }
-
-    D3D12_RANGE read_range = { 0, 0 };
-    hr = buffer_ctx->resource->Map(0, &read_range, &buffer_ctx->mapped_ptr);
-    if (FAILED(hr)) {
-        d3d12_log_hr("ID3D12Resource::Map(host upload)", hr);
-        delete buffer_ctx;
-        return nullptr;
-    }
-
-    buffer_ctx->base = buffer_ctx->mapped_ptr;
-    return ggml_backend_buffer_init(buft, ggml_backend_d3d12_buffer_i, buffer_ctx, size);
+    buffer->buft = buft;
+    buffer->iface.free_buffer = ggml_backend_d3d12_host_buffer_free_buffer;
+    return buffer;
 }
 
 static bool ggml_backend_d3d12_host_buffer_type_is_host(ggml_backend_buffer_type_t buft) {
@@ -1116,8 +1247,45 @@ namespace ggml_d3d12 {
 static d3d12_buffer * resolve_buffer(const ggml_tensor * tensor) {
     if (tensor == nullptr) return nullptr;
     ggml_backend_buffer_t buf_b = d3d12_tensor_buffer(tensor);
-    if (buf_b == nullptr) return nullptr;
+    if (buf_b == nullptr || buf_b->buft == nullptr) return nullptr;
+    // Only our DEFAULT-heap D3D12 buffer type stores a d3d12_buffer* in its
+    // context. The d3d12 HOST buffer type stores a d3d12_host_buffer*, and
+    // any other backend (CPU, ...) stores something completely different.
+    // Casting blind here would yield garbage and silently mis-route data.
+    if (buf_b->buft->iface.get_name != ggml_backend_d3d12_buffer_type_get_name) {
+        return nullptr;
+    }
     return static_cast<d3d12_buffer *>(buf_b->context);
+}
+
+// Returns true if `tensor` lives on the D3D12 HOST buffer type of this
+// backend (an UPLOAD-heap resource CPU-mapped for the engine to fill). Sets
+// *out_resource / *out_off_bytes / *out_size_bytes when the tensor is on
+// such a buffer. Returns false otherwise (e.g. CPU backend tensor).
+static bool resolve_host_buffer(const ggml_tensor * tensor,
+                                ID3D12Resource ** out_resource,
+                                size_t * out_off_bytes,
+                                size_t * out_size_bytes);
+
+static bool resolve_host_buffer(const ggml_tensor * tensor,
+                                ID3D12Resource ** out_resource,
+                                size_t * out_off_bytes,
+                                size_t * out_size_bytes) {
+    // The D3D12 host buffer type now allocates plain CPU memory (wrapped via
+    // ggml_backend_cpu_buffer_from_ptr) rather than a D3D12 UPLOAD-heap
+    // resource. The wrapper's buffer->context is the raw void* allocation,
+    // NOT a d3d12_buffer*, so blindly casting would dereference garbage.
+    // The CPU fallback path in ctx_stage_tensor_uav (memcpy via tensor->data
+    // through the per-context scratch upload buffer) already handles host
+    // buffer tensors correctly, so we simply decline the GPU zero-copy path
+    // here. A future optimization could use OpenExistingHeapFromAddress to
+    // register the CPU allocation as a D3D12 heap and avoid the staging
+    // copy, but that's a perf-only change.
+    GGML_UNUSED(tensor);
+    GGML_UNUSED(out_resource);
+    GGML_UNUSED(out_off_bytes);
+    GGML_UNUSED(out_size_bytes);
+    return false;
 }
 
 tensor_resource ctx_resolve_tensor(dispatch_ctx & ctx, const ggml_tensor * tensor) {
@@ -1184,6 +1352,189 @@ bool ctx_bind_raw_uavs(dispatch_ctx & ctx,
     }
     *out_table_gpu = r.base.gpu;
     return true;
+}
+
+bool ctx_bind_raw_uavs_resolved(dispatch_ctx & ctx,
+                                const tensor_resource * resources,
+                                size_t count,
+                                D3D12_GPU_DESCRIPTOR_HANDLE * out_table_gpu) {
+    if (ctx.device == nullptr || ctx.uav_heap == nullptr || out_table_gpu == nullptr) return false;
+    if (count == 0 || count > std::numeric_limits<uint32_t>::max()) return false;
+
+    desc_range r = ctx.uav_heap->allocate(static_cast<uint32_t>(count));
+    if (!r.base.valid) return false;
+
+    D3D12_UNORDERED_ACCESS_VIEW_DESC uav_desc = {};
+    uav_desc.ViewDimension                  = D3D12_UAV_DIMENSION_BUFFER;
+    uav_desc.Format                         = DXGI_FORMAT_R32_TYPELESS;
+    uav_desc.Buffer.FirstElement            = 0;
+    uav_desc.Buffer.StructureByteStride     = 0;
+    uav_desc.Buffer.CounterOffsetInBytes    = 0;
+    uav_desc.Buffer.Flags                   = D3D12_BUFFER_UAV_FLAG_RAW;
+
+    for (size_t i = 0; i < count; ++i) {
+        if (!resources[i].valid || resources[i].resource == nullptr) return false;
+        uav_desc.Buffer.NumElements = static_cast<UINT>(resources[i].buffer_size_bytes / 4);
+        D3D12_CPU_DESCRIPTOR_HANDLE cpu = { r.base.cpu.ptr + r.stride * static_cast<UINT>(i) };
+        ctx.device->CreateUnorderedAccessView(resources[i].resource, nullptr, &uav_desc, cpu);
+    }
+    *out_table_gpu = r.base.gpu;
+    return true;
+}
+
+// --- Transfer scratch buffer management -------------------------------------
+// scratch_upload: UPLOAD heap, mapped, used as CPU staging when source data
+//                 lives in CPU (non-D3D12) memory.
+// scratch_dev:    DEFAULT heap, UAV-capable, the actual resource bound to
+//                 compute shaders. Data lands here either via CopyBufferRegion
+//                 from a host UPLOAD-heap resource or via
+//                 CopyBufferRegion(scratch_dev <- scratch_upload).
+
+static constexpr size_t D3D12_SCRATCH_INITIAL = 16 * 1024 * 1024;  // 16 MiB
+static constexpr size_t D3D12_SCRATCH_SLOT_ALIGN = 16;
+
+static bool d3d12_scratch_ensure(d3d12_device * dev, size_t needed) {
+    if (dev == nullptr || dev->device == nullptr) return false;
+
+    // Grow upload (mapped) buffer.
+    if (!dev->scratch_upload || dev->scratch_upload_capacity < needed) {
+        if (dev->scratch_upload && dev->scratch_upload_ptr) {
+            dev->scratch_upload->Unmap(0, nullptr);
+            dev->scratch_upload_ptr = nullptr;
+        }
+        dev->scratch_upload.Reset();
+        dev->scratch_upload_capacity = 0;
+
+        const size_t alloc = std::max<size_t>(needed, D3D12_SCRATCH_INITIAL);
+        D3D12_HEAP_PROPERTIES heap_props = d3d12_heap_properties(D3D12_HEAP_TYPE_UPLOAD);
+        D3D12_RESOURCE_DESC desc = d3d12_buffer_desc(alloc, D3D12_RESOURCE_FLAG_NONE);
+        HRESULT hr = dev->device->CreateCommittedResource(
+            &heap_props, D3D12_HEAP_FLAG_NONE, &desc, D3D12_RESOURCE_STATE_GENERIC_READ,
+            nullptr, IID_PPV_ARGS(&dev->scratch_upload));
+        if (FAILED(hr)) {
+            d3d12_log_hr("CreateCommittedResource(scratch_upload)", hr);
+            return false;
+        }
+        D3D12_RANGE read_range = { 0, 0 };
+        hr = dev->scratch_upload->Map(0, &read_range, &dev->scratch_upload_ptr);
+        if (FAILED(hr)) {
+            d3d12_log_hr("ID3D12Resource::Map(scratch_upload)", hr);
+            dev->scratch_upload.Reset();
+            return false;
+        }
+        dev->scratch_upload_capacity = alloc;
+    }
+
+    // Grow default (UAV) buffer.
+    if (!dev->scratch_dev || dev->scratch_dev_capacity < needed) {
+        dev->scratch_dev.Reset();
+        dev->scratch_dev_capacity = 0;
+        dev->scratch_dev_state = D3D12_RESOURCE_STATE_UNORDERED_ACCESS;
+
+        const size_t alloc = std::max<size_t>(needed, D3D12_SCRATCH_INITIAL);
+        D3D12_HEAP_PROPERTIES heap_props = d3d12_heap_properties(D3D12_HEAP_TYPE_DEFAULT);
+        D3D12_RESOURCE_DESC desc = d3d12_buffer_desc(alloc, D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS);
+        HRESULT hr = dev->device->CreateCommittedResource(
+            &heap_props, D3D12_HEAP_FLAG_NONE, &desc, D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
+            nullptr, IID_PPV_ARGS(&dev->scratch_dev));
+        if (FAILED(hr)) {
+            d3d12_log_hr("CreateCommittedResource(scratch_dev)", hr);
+            return false;
+        }
+        dev->scratch_dev_capacity = alloc;
+        dev->scratch_dev_state = D3D12_RESOURCE_STATE_UNORDERED_ACCESS;
+    }
+
+    return true;
+}
+
+// Ensure scratch_dev is in the requested state on the given command list,
+// emitting a transition if necessary. Tracks state on the device struct.
+static void d3d12_scratch_transition(d3d12_device * dev, ID3D12GraphicsCommandList * cmd, D3D12_RESOURCE_STATES after) {
+    if (dev == nullptr || cmd == nullptr || !dev->scratch_dev) return;
+    if (dev->scratch_dev_state == after) return;
+    D3D12_RESOURCE_BARRIER barrier = {};
+    barrier.Type                   = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+    barrier.Transition.pResource   = dev->scratch_dev.Get();
+    barrier.Transition.StateBefore = dev->scratch_dev_state;
+    barrier.Transition.StateAfter  = after;
+    barrier.Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
+    cmd->ResourceBarrier(1, &barrier);
+    dev->scratch_dev_state = after;
+}
+
+void ctx_scratch_reset(dispatch_ctx & ctx) {
+    d3d12_device * dev = static_cast<d3d12_device *>(ctx.dev_opaque);
+    if (dev == nullptr) return;
+    dev->scratch_offset = 0;
+    // Leave allocated buffers in place; they'll be reused next graph.
+    // scratch_dev_state is left as-is (UNORDERED_ACCESS from create or from
+    // last transition; we will transition as needed when copying).
+}
+
+tensor_resource ctx_stage_tensor_uav(dispatch_ctx & ctx, const ggml_tensor * tensor) {
+    tensor_resource out{};
+    if (tensor == nullptr) return out;
+    d3d12_device * dev = static_cast<d3d12_device *>(ctx.dev_opaque);
+    if (dev == nullptr || ctx.cmd == nullptr) return out;
+
+    // Fast path: tensor already lives on a D3D12 DEFAULT-heap buffer of this device.
+    d3d12_buffer * buf = resolve_buffer(tensor);  // null for host or non-D3D12 buffers
+    if (buf != nullptr && buf->dev == dev && buf->resource) {
+        d3d12_transition(ctx.cmd, buf, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+        out.resource          = buf->resource.Get();
+        out.offset_bytes      = d3d12_tensor_offset(buf, tensor, 0);
+        out.buffer_size_bytes = buf->size;
+        out.valid             = true;
+        return out;
+    }
+
+    // Slow path: stage into per-graph scratch buffer.
+    const size_t bytes = ggml_nbytes(tensor);
+    if (bytes == 0) {
+        // Empty tensor — return any valid resource at offset 0 so the bind
+        // doesn't fail. The shader's bounds checks must skip empty tensors.
+        if (!d3d12_scratch_ensure(dev, D3D12_SCRATCH_SLOT_ALIGN)) return out;
+        out.resource          = dev->scratch_dev.Get();
+        out.offset_bytes      = 0;
+        out.buffer_size_bytes = dev->scratch_dev_capacity;
+        out.valid             = true;
+        return out;
+    }
+
+    const size_t aligned_size = (bytes + D3D12_SCRATCH_SLOT_ALIGN - 1) & ~(D3D12_SCRATCH_SLOT_ALIGN - 1);
+    const size_t slot = dev->scratch_offset;
+    const size_t needed = slot + aligned_size;
+    if (!d3d12_scratch_ensure(dev, needed)) return out;
+    dev->scratch_offset = slot + aligned_size;
+
+    ID3D12Resource * host_res = nullptr;
+    size_t host_off = 0;
+    if (resolve_host_buffer(tensor, &host_res, &host_off, nullptr)) {
+        // D3D12 host buffer (UPLOAD heap). GPU→GPU copy avoids touching CPU.
+        d3d12_scratch_transition(dev, ctx.cmd, D3D12_RESOURCE_STATE_COPY_DEST);
+        ctx.cmd->CopyBufferRegion(dev->scratch_dev.Get(), slot, host_res, host_off, bytes);
+    } else {
+        // CPU buffer (not ours). memcpy through scratch_upload, then GPU copy.
+        const void * src_data = tensor->data;
+        if (src_data == nullptr) return out;
+        std::memcpy(static_cast<char *>(dev->scratch_upload_ptr) + slot, src_data, bytes);
+        d3d12_scratch_transition(dev, ctx.cmd, D3D12_RESOURCE_STATE_COPY_DEST);
+        ctx.cmd->CopyBufferRegion(dev->scratch_dev.Get(), slot, dev->scratch_upload.Get(), slot, bytes);
+    }
+
+    // Caller (or subsequent calls) will transition scratch back to UAV via
+    // d3d12_scratch_transition before dispatch. We do the transition now so
+    // the returned record is immediately bindable, but defer the UAV barrier
+    // (one barrier per dispatch is fine — the transition itself acts as
+    // ordering on the destination).
+    d3d12_scratch_transition(dev, ctx.cmd, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+
+    out.resource          = dev->scratch_dev.Get();
+    out.offset_bytes      = slot;
+    out.buffer_size_bytes = dev->scratch_dev_capacity;
+    out.valid             = true;
+    return out;
 }
 
 ID3D12RootSignature * ctx_get_root_sig(dispatch_ctx & ctx,
@@ -1259,6 +1610,8 @@ static enum ggml_status ggml_backend_d3d12_graph_compute(ggml_backend_t backend,
     dctx.psos       = &dev->psos;
     dctx.root_sigs  = &dev->root_sigs;
 
+    ggml_d3d12::ctx_scratch_reset(dctx);
+
     for (int i = 0; i < cgraph->n_nodes; ++i) {
         ggml_tensor * node = cgraph->nodes[i];
         if (node == nullptr) continue;
@@ -1273,6 +1626,18 @@ static enum ggml_status ggml_backend_d3d12_graph_compute(ggml_backend_t backend,
                 continue;
             default:
                 break;
+        }
+
+        // Debug: dump every op we process. Enable with GGML_D3D12_LOG_OPS=1.
+        if (std::getenv("GGML_D3D12_LOG_OPS")) {
+            const ggml_tensor * s0 = node->src[0];
+            const ggml_tensor * s1 = node->src[1];
+            GGML_LOG_INFO("ggml_d3d12: op[%d] %s dst[%lld,%lld,%lld,%lld] type=%s%s%s%s%s\n",
+                i, ggml_op_name(node->op),
+                (long long)node->ne[0], (long long)node->ne[1], (long long)node->ne[2], (long long)node->ne[3],
+                ggml_type_name(node->type),
+                s0 ? " s0=" : "", s0 ? ggml_type_name(s0->type) : "",
+                s1 ? " s1=" : "", s1 ? ggml_type_name(s1->type) : "");
         }
 
         // === op dispatchers (one per category) ===
@@ -1507,6 +1872,25 @@ static bool ggml_backend_d3d12_device_supports_op(ggml_backend_dev_t dev, const 
             break;
     }
 
+    // Debug kill-switch: comma-separated list of ggml op names (e.g.
+    // "MUL_MAT,SET_ROWS,ROPE") to force-fallback to CPU. Used to bisect
+    // numerical bugs at runtime without rebuilds.
+    if (const char * disable = std::getenv("GGML_D3D12_DISABLE_OPS")) {
+        const char * op_name = ggml_op_name(op->op);
+        if (op_name != nullptr) {
+            const char * p = disable;
+            while (*p) {
+                const char * comma = strchr(p, ',');
+                size_t len = comma ? (size_t)(comma - p) : strlen(p);
+                if (len == strlen(op_name) && strncmp(p, op_name, len) == 0) {
+                    return false;
+                }
+                if (!comma) break;
+                p = comma + 1;
+            }
+        }
+    }
+
     // === op support checks (one per category) ===
     // New Phase 5 op groups append their supports_op_<cat> call here.
     if (ggml_d3d12::supports_op_memops(op))     return true;
@@ -1530,9 +1914,20 @@ static bool ggml_backend_d3d12_device_supports_op(ggml_backend_dev_t dev, const 
 }
 
 static bool ggml_backend_d3d12_device_supports_buft(ggml_backend_dev_t dev, ggml_backend_buffer_type_t buft) {
-    if (buft == ggml_backend_d3d12_host_buffer_type()) {
-        return true;
-    }
+    // NOTE: deliberately does NOT accept ggml_backend_d3d12_host_buffer_type().
+    // Our D3D12 host buffer is plain CPU memory (wrapped via
+    // ggml_backend_cpu_buffer_from_ptr) — it has no D3D12 GPU resource, so we
+    // cannot write op outputs into it via UAV. If we returned true here the
+    // scheduler would happily place op destinations on D3D12_Host and our
+    // ctx_stage_tensor_uav would silently write the results into per-graph
+    // scratch with no way to propagate them back to the host memory, producing
+    // garbage downstream. The host buffer is purely a CPU-side bridge that
+    // *other* backends (CPU) write into and that we *read from* via the slow
+    // path in ctx_stage_tensor_uav. This matches the Vulkan backend, which
+    // also only advertises its DEFAULT-heap (device) buffer through
+    // supports_buft. A future optimization could use
+    // ID3D12Device3::OpenExistingHeapFromAddress to get a real D3D12 resource
+    // over the CPU allocation and re-enable host as a valid op destination.
     if (buft == nullptr || buft->iface.get_name != ggml_backend_d3d12_buffer_type_get_name) {
         return false;
     }

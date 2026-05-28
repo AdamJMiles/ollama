@@ -247,8 +247,8 @@ if(WIN32)
             add_subdirectory(${CMAKE_CURRENT_SOURCE_DIR}/ml/backend/ggml/ggml/src/ggml-d3d12)
             target_include_directories(ggml-d3d12 PRIVATE ${GGML_INCLUDE_DIRS} ${D3D12_HEADER})
             install(TARGETS ggml-d3d12
-                RUNTIME DESTINATION ${OLLAMA_INSTALL_DIR} COMPONENT D3D12
-                LIBRARY DESTINATION ${OLLAMA_INSTALL_DIR} COMPONENT D3D12
+                RUNTIME DESTINATION ${OLLAMA_INSTALL_DIR}/d3d12 COMPONENT D3D12
+                LIBRARY DESTINATION ${OLLAMA_INSTALL_DIR}/d3d12 COMPONENT D3D12
             )
         else()
             message(STATUS "DXC not found, skipping ggml-d3d12 backend")

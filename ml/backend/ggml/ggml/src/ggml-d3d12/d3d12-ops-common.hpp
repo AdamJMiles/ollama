@@ -63,6 +63,21 @@ struct tensor_resource {
 // on the same d3d12 device as `ctx`.
 tensor_resource ctx_resolve_tensor(dispatch_ctx & ctx, const ggml_tensor * tensor);
 
+// Resolve a tensor for UAV binding. For tensors already on a DEFAULT-heap
+// D3D12 buffer of this device, returns the tensor's own resource + offset
+// (after transitioning it to UNORDERED_ACCESS). For tensors on UPLOAD-heap
+// host buffers, or on CPU backend buffers, stages the tensor's bytes into
+// the device's per-graph transfer scratch buffer (a DEFAULT-heap UAV
+// buffer) and returns the scratch resource + slot offset. On the next
+// dispatch the returned resource is guaranteed to be in UAV state.
+//
+// Caller is expected to use this for inputs that need to be readable by
+// a compute shader. For outputs the tensor must already be on a DEFAULT
+// heap buffer; this function still works (it'll take the no-staging path)
+// but returns valid=false if the tensor is on host/CPU memory (we cannot
+// write back into host memory through the GPU here).
+tensor_resource ctx_stage_tensor_uav(dispatch_ctx & ctx, const ggml_tensor * tensor);
+
 // Transition the underlying resource of `tensor` to `after`. No-op (returns
 // true) if already in that state. Returns false on bad input.
 bool ctx_transition(dispatch_ctx & ctx, const ggml_tensor * tensor, D3D12_RESOURCE_STATES after);
@@ -78,6 +93,18 @@ bool ctx_bind_raw_uavs(dispatch_ctx & ctx,
                        const ggml_tensor * const * tensors,
                        size_t count,
                        D3D12_GPU_DESCRIPTOR_HANDLE * out_table_gpu);
+
+// Bind a contiguous descriptor range of raw UAVs from already-resolved
+// tensor_resource records (e.g. returned by ctx_stage_tensor_uav). All
+// resources must be valid. On success returns true and fills *out_table_gpu.
+bool ctx_bind_raw_uavs_resolved(dispatch_ctx & ctx,
+                                const tensor_resource * resources,
+                                size_t count,
+                                D3D12_GPU_DESCRIPTOR_HANDLE * out_table_gpu);
+
+// Reset the per-graph transfer scratch bump allocator. Called once at the
+// start of each graph_compute by ggml_backend_d3d12_graph_compute.
+void ctx_scratch_reset(dispatch_ctx & ctx);
 
 // Look up (or create) a cached root signature. Returns nullptr on failure.
 ID3D12RootSignature * ctx_get_root_sig(dispatch_ctx & ctx,
