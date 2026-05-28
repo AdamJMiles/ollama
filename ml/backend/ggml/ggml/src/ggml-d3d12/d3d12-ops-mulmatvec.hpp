@@ -98,7 +98,12 @@ inline bool supports_op_mulmatvec(const ggml_tensor * op) {
     if (src0->ne[0] != src1->ne[0]) return false;
     if (op->ne[0] != src0->ne[1] || op->ne[1] != 1 || op->ne[2] != src1->ne[2] || op->ne[3] != src1->ne[3]) return false;
 
-    if (src0->ne[2] != src1->ne[2] || src0->ne[3] != src1->ne[3]) return false;
+    // GQA broadcast: each src0 head/batch dim must divide src1's, so the shader
+    // can index src0 via (i_n / broadcast_n) (i.e. each src0 head is shared
+    // by `broadcast2` query heads, matching CUDA/Vulkan conventions).
+    if (src0->ne[2] <= 0 || src0->ne[3] <= 0) return false;
+    if ((src1->ne[2] % src0->ne[2]) != 0) return false;
+    if ((src1->ne[3] % src0->ne[3]) != 0) return false;
 
     const int64_t blck = ggml_blck_size(src0->type);
     if (ggml_is_quantized(src0->type) && (blck <= 0 || (src0->ne[0] % blck) != 0)) return false;
@@ -130,6 +135,9 @@ inline bool dispatch_mulmatvec(dispatch_ctx & ctx, const ggml_tensor * node) {
     const uint64_t batch = ne2 * static_cast<uint64_t>(src1->ne[3]);
     if (K == 0 || M == 0 || batch == 0) return true;
 
+    const uint64_t broadcast2 = static_cast<uint64_t>(src1->ne[2]) / static_cast<uint64_t>(src0->ne[2]);
+    const uint64_t broadcast3 = static_cast<uint64_t>(src1->ne[3]) / static_cast<uint64_t>(src0->ne[3]);
+
     const uint64_t constants[] = {
         K,
         M,
@@ -147,6 +155,8 @@ inline bool dispatch_mulmatvec(dispatch_ctx & ctx, const ggml_tensor * node) {
         static_cast<uint64_t>(src1->nb[3]),
         static_cast<uint64_t>(node->nb[2]),
         static_cast<uint64_t>(node->nb[3]),
+        broadcast2,
+        broadcast3,
     };
     for (uint64_t value : constants) {
         if (!mulmatvec_fits_u32(value)) return true;
@@ -162,12 +172,12 @@ inline bool dispatch_mulmatvec(dispatch_ctx & ctx, const ggml_tensor * node) {
     const ggml_tensor * uavs[3] = { src0, src1, node };
     if (!ctx_bind_raw_uavs(ctx, uavs, 3, &uav_table)) return true;
 
-    ID3D12RootSignature * root_sig = ctx_get_root_sig(ctx, 3, 16);
+    ID3D12RootSignature * root_sig = ctx_get_root_sig(ctx, 3, 18);
     if (root_sig == nullptr) return true;
     ID3D12PipelineState * pso = ctx.psos->get(shader, root_sig, {});
     if (pso == nullptr) return true;
 
-    const UINT consts[16] = {
+    const UINT consts[18] = {
         static_cast<UINT>(K),
         static_cast<UINT>(M),
         static_cast<UINT>(batch),
@@ -184,8 +194,10 @@ inline bool dispatch_mulmatvec(dispatch_ctx & ctx, const ggml_tensor * node) {
         static_cast<UINT>(src1->nb[3]),
         static_cast<UINT>(node->nb[2]),
         static_cast<UINT>(node->nb[3]),
+        static_cast<UINT>(broadcast2),
+        static_cast<UINT>(broadcast3),
     };
-    if (!ctx_bind_compute(ctx, pso, root_sig, uav_table, 3, consts, 16)) return true;
+    if (!ctx_bind_compute(ctx, pso, root_sig, uav_table, 3, consts, 18)) return true;
 
     ctx_dispatch_groups(ctx, static_cast<UINT>(M), static_cast<UINT>(batch), 1);
     ctx_uav_barrier(ctx, node);
