@@ -734,7 +734,11 @@ static bool d3d12_device_ensure(d3d12_device * dev) {
         return false;
     }
 
-    if (!dev->uav_heap.init(dev->device.Get(), D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV, 4096, /*shader_visible=*/true)) {
+    // Capacity sized for a full decode-graph pass: a Qwen-class model has
+    // ~1100 graph nodes, each op may allocate 2-3 UAVs, and we don't recycle
+    // mid-pass (mark_used/reclaim_to runs at submit time). 64 KiB descriptors
+    // is well above worst case and only costs ~2 MiB on a CBV/SRV/UAV heap.
+    if (!dev->uav_heap.init(dev->device.Get(), D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV, 65536, /*shader_visible=*/true)) {
         d3d12_release_runtime(dev);
         return false;
     }
@@ -988,7 +992,23 @@ static size_t ggml_backend_d3d12_buffer_type_get_alignment(ggml_backend_buffer_t
 
 static size_t ggml_backend_d3d12_buffer_type_get_max_size(ggml_backend_buffer_type_t buft) {
     GGML_UNUSED(buft);
-    return SIZE_MAX;
+    // We hit an apparent NVIDIA driver bug (RTX 3090 Ti, recent driver) where
+    // raw UAVs with FirstElement * 4 >= 4 GiB silently return zero/garbage from
+    // shader loads even though the API accepts the descriptor and the
+    // resulting view bounds are valid 64-bit GPU virtual addresses. Concretely:
+    // a 7 GiB committed model buffer with weights past offset 4 GiB cannot be
+    // bound for shader reads via our sliding-FirstElement UAV path (Q8_0
+    // mul_mm produces garbage for all dispatches whose src0 lives beyond the
+    // first 4 GiB, but is bit-exact for everything below). The ggml allocator
+    // respects this hint and chunks weight allocations into multiple backend
+    // buffers, each well within the safe descriptor range. Override with
+    // GGML_D3D12_MAX_BUFFER_BYTES if you need to test the unchunked path.
+    if (const char * env = std::getenv("GGML_D3D12_MAX_BUFFER_BYTES")) {
+        const long long v = std::strtoll(env, nullptr, 10);
+        if (v > 0) return static_cast<size_t>(v);
+    }
+    constexpr size_t SAFE_MAX = static_cast<size_t>(3) * 1024 * 1024 * 1024; // 3 GiB
+    return SAFE_MAX;
 }
 
 static bool ggml_backend_d3d12_buffer_type_is_host(ggml_backend_buffer_type_t buft) {
@@ -1415,10 +1435,19 @@ bool ctx_bind_raw_uavs_sliding(dispatch_ctx & ctx,
         tensor_resource res = ctx_resolve_tensor(ctx, tensors[i]);
         if (!res.valid) return false;
 
-        // Slide FirstElement to a 4-byte aligned boundary covering the
-        // tensor; the residue (offset_bytes % 4) becomes the in-shader
-        // starting offset. For correctly-aligned tensors the residue is 0.
-        const uint64_t first_byte    = static_cast<uint64_t>(res.offset_bytes) & ~uint64_t{3};
+        // Slide FirstElement to a 16-byte aligned boundary covering the
+        // tensor; the residue (offset_bytes % 16) becomes the in-shader
+        // starting offset. D3D12 requires RAW UAV FirstElement to express a
+        // byte offset that is a multiple of 16 (so FirstElement must be a
+        // multiple of 4 for 4-byte raw elements). The debug layer triggers
+        // device-removed otherwise.
+        //
+        // For correctly-aligned tensors (256 B base alignment in our
+        // allocator) the residue is 0; only tensors sliced into a parent
+        // via view_offs not a multiple of 16 incur a non-zero residue.
+        // residue is guaranteed to be a multiple of 4 because ggml tensor
+        // offsets are at least 4 B aligned (nb[0] >= sizeof(uint32_t)).
+        const uint64_t first_byte    = static_cast<uint64_t>(res.offset_bytes) & ~uint64_t{15};
         const uint64_t residue_bytes = static_cast<uint64_t>(res.offset_bytes) - first_byte;
         const uint64_t remaining     = static_cast<uint64_t>(res.buffer_size_bytes) - first_byte;
         const uint64_t num_elements  = (remaining > (uint64_t{1} << 32)) ? (uint64_t{1} << 32) / 4 : remaining / 4;

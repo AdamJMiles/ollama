@@ -64,13 +64,6 @@ inline bool supports_op_mulmm(const ggml_tensor * op) {
 
     if (src1->ne[1] < 2) return false;
     if (src0->type != GGML_TYPE_F32 && src0->type != GGML_TYPE_F16 && src0->type != GGML_TYPE_Q8_0) return false;
-    // Q8_0 mul_mm groundwork (dequant + tiled and naive shaders, plus the
-    // ne-broadcast plumbing) is in place but currently produces incorrect
-    // results for the Qwen2.5-style decode shapes that this path would
-    // intercept (root cause TBD). Keep it opt-in until the bug is fixed
-    // — without it the prompt-eval / chunked-decode Q8_0 mul_mats stay on
-    // CPU as before.
-    if (src0->type == GGML_TYPE_Q8_0 && std::getenv("GGML_D3D12_ENABLE_MULMM_Q8_0") == nullptr) return false;
     if (src1->type != GGML_TYPE_F32 || op->type != GGML_TYPE_F32) return false;
     if (src0->ne[0] != src1->ne[0]) return false;
     if (op->ne[0] != src0->ne[1] || op->ne[1] != src1->ne[1]) return false;
@@ -107,6 +100,7 @@ inline bool dispatch_mulmm(dispatch_ctx & ctx, const ggml_tensor * node) {
 
     const ggml_tensor * src0 = node->src[0];
     const ggml_tensor * src1 = node->src[1];
+
     const char * shader;
     if (src0->type == GGML_TYPE_Q8_0) {
         shader = (std::getenv("GGML_D3D12_MULMM_Q8_NAIVE") != nullptr)
@@ -176,6 +170,13 @@ inline bool dispatch_mulmm(dispatch_ctx & ctx, const ggml_tensor * node) {
     if (!ctx_transition(ctx, src0, D3D12_RESOURCE_STATE_UNORDERED_ACCESS)) return true;
     if (!ctx_transition(ctx, src1, D3D12_RESOURCE_STATE_UNORDERED_ACCESS)) return true;
     if (!ctx_transition(ctx, node, D3D12_RESOURCE_STATE_UNORDERED_ACCESS)) return true;
+
+    // Insert UAV barriers on inputs to ensure any prior writes to these
+    // resources have completed before we read them. The transition layer only
+    // inserts state-transition barriers; resource-to-resource UAV ordering
+    // requires explicit UAV barriers.
+    ctx_uav_barrier(ctx, src0);
+    ctx_uav_barrier(ctx, src1);
 
     D3D12_GPU_DESCRIPTOR_HANDLE uav_table = {};
     const ggml_tensor * uavs[3] = { src0, src1, node };

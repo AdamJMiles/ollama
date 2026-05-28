@@ -26,8 +26,22 @@ inline bool supports_op_memops(const ggml_tensor * op) {
             // Same-type byte copy (F32->F32 covers the original case but also
             // F16->F16, Q8_0->Q8_0, etc. since this is just a bulk byte copy
             // for contiguous tensors of identical layout).
+            //
+            // Quantized types must additionally have matching shape: for Q-types
+            // the CPU reference walks blocks in shape order (i0,i1,i2,i3) and
+            // assigns to dst's block grid, which only coincides with a flat
+            // memcpy when shapes are identical. ne_src != ne_dst with
+            // ggml_nbytes equal still produces a different element layout per
+            // CPU semantics.
+            //
+            // copy_f32 issues one 32-bit Store per thread, so total bytes must
+            // be a multiple of 4. Q4_0 (18 B/block) rows of odd block count are
+            // not 4-aligned and would silently lose the trailing 2 bytes.
             if (src->type == op->type) {
-                return ggml_nbytes(src) == ggml_nbytes(op);
+                if (ggml_nbytes(src) != ggml_nbytes(op)) return false;
+                if (ggml_is_quantized(src->type) && !ggml_are_same_shape(src, op)) return false;
+                if ((ggml_nbytes(op) % 4u) != 0u) return false;
+                return true;
             }
             // F32 -> F16 conversion (KV cache writes during decode).
             if (src->type == GGML_TYPE_F32 && op->type == GGML_TYPE_F16) {

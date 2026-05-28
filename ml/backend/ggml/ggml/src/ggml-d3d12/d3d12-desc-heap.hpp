@@ -4,6 +4,8 @@
 #include <d3d12.h>
 #include <wrl/client.h>
 
+#include "ggml-impl.h"
+
 #include <cstddef>
 #include <cstdint>
 #include <cstdio>
@@ -133,17 +135,21 @@ inline desc_range desc_heap_ring::allocate(uint32_t count) {
         wrapped = true;
         index = 0;
         if (tail_ == 0 || count > tail_) {
-            std::fprintf(stderr,
-                         "[d3d12] desc_heap_ring::allocate warning: wrapped range [0, %u) overruns live tail %u\n",
-                         count,
-                         tail_);
+            GGML_LOG_ERROR(
+                "[d3d12] desc_heap_ring::allocate ERROR: wrapped range [0, %u) overruns live tail %u "
+                "(capacity=%u). Increase heap capacity or recycle more often.\n",
+                count,
+                tail_,
+                capacity_);
         }
     } else if (head_ < tail_ && head_ + count > tail_) {
-        std::fprintf(stderr,
-                     "[d3d12] desc_heap_ring::allocate warning: range [%u, %u) overruns live tail %u\n",
-                     head_,
-                     head_ + count,
-                     tail_);
+        GGML_LOG_ERROR(
+            "[d3d12] desc_heap_ring::allocate ERROR: range [%u, %u) overruns live tail %u "
+            "(capacity=%u). Increase heap capacity or recycle more often.\n",
+            head_,
+            head_ + count,
+            tail_,
+            capacity_);
     }
 
     range.base.cpu.ptr = cpu_base_.ptr + static_cast<SIZE_T>(index) * stride_;
