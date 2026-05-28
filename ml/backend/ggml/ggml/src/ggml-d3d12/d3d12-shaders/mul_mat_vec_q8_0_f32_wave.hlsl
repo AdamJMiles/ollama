@@ -52,6 +52,11 @@ float load_f16(RWByteAddressBuffer buf, uint off) {
 
 groupshared float partials[TG];
 
+// Reduce `local` across the WG. Only the return value at gtid.x == 0u is
+// meaningful — callers that need the result on every thread should broadcast
+// via groupshared or WaveReadLaneAt themselves. Single barrier (vs the
+// previous two-barrier scheme) since the final read-and-sum is done only by
+// thread 0.
 float wave_reduce_sum(float local, uint tid) {
     const uint lane = WaveGetLaneIndex();
     const uint wave_size = WaveGetLaneCount();
@@ -64,18 +69,13 @@ float wave_reduce_sum(float local, uint tid) {
     }
     GroupMemoryBarrierWithGroupSync();
 
-    if (wave == 0u) {
-        float total = 0.0f;
-        for (uint i = lane; i < num_waves; i += wave_size) {
+    float total = 0.0f;
+    if (tid == 0u) {
+        [unroll(8)] for (uint i = 0u; i < num_waves; ++i) {
             total += partials[i];
         }
-        total = WaveActiveSum(total);
-        if (lane == 0u) {
-            partials[0] = total;
-        }
     }
-    GroupMemoryBarrierWithGroupSync();
-    return partials[0];
+    return total;
 }
 
 [numthreads(TG, 1, 1)]
@@ -109,6 +109,78 @@ void main(uint3 gid : SV_GroupID, uint3 gtid : SV_GroupThreadID) {
     const uint stride = TG * 4u;
     const uint k_main = K & ~3u;
     uint k = gtid.x * 4u;
+
+    // Manually unrolled by 2: each iteration issues all loads for two
+    // groups of 4 quants before doing any MACs. The interleaved loads
+    // give the hardware more memory parallelism to hide latency, which
+    // matters especially for the large-K case (K=18944) where per-WG
+    // activation footprint exceeds the L1 working set.
+    const uint stride2 = stride * 2u;
+    [loop]
+    while (k + stride + 4u <= k_main) {
+        // ----- group 0 @ k -----
+        const uint block_0     = k / QK;
+        const uint elem_0      = k & (QK - 1u);
+        const uint block_off_0 = row_base + block_0 * BLOCK_SIZE;
+        const uint quants_off_0 = block_off_0 + QS_OFFSET + elem_0;
+        const uint base_word_0 = quants_off_0 & ~3u;
+        const uint shift_0     = (quants_off_0 & 3u) * 8u;
+        const uint w0_0 = src0_buf.Load(base_word_0);
+        const uint w1_0 = src0_buf.Load(base_word_0 + 4u);
+        const uint w1s_0 = (shift_0 == 0u) ? 0u : (w1_0 << (32u - shift_0));
+        const uint packed_0 = (w0_0 >> shift_0) | w1s_0;
+        const float scale_0 = load_f16_aligned2(src0_buf, block_off_0);
+        const uint4 a_packed_0 = src1_buf.Load4(vec_base + k * 4u);
+
+        // ----- group 1 @ k + stride -----
+        const uint k1 = k + stride;
+        const uint block_1     = k1 / QK;
+        const uint elem_1      = k1 & (QK - 1u);
+        const uint block_off_1 = row_base + block_1 * BLOCK_SIZE;
+        const uint quants_off_1 = block_off_1 + QS_OFFSET + elem_1;
+        const uint base_word_1 = quants_off_1 & ~3u;
+        const uint shift_1     = (quants_off_1 & 3u) * 8u;
+        const uint w0_1 = src0_buf.Load(base_word_1);
+        const uint w1_1 = src0_buf.Load(base_word_1 + 4u);
+        const uint w1s_1 = (shift_1 == 0u) ? 0u : (w1_1 << (32u - shift_1));
+        const uint packed_1 = (w0_1 >> shift_1) | w1s_1;
+        const float scale_1 = load_f16_aligned2(src0_buf, block_off_1);
+        const uint4 a_packed_1 = src1_buf.Load4(vec_base + k1 * 4u);
+
+        // ----- compute group 0 -----
+        const int q0_0 = (int)(packed_0 << 24) >> 24;
+        const int q1_0 = (int)(packed_0 << 16) >> 24;
+        const int q2_0 = (int)(packed_0 <<  8) >> 24;
+        const int q3_0 = (int) packed_0         >> 24;
+        const float a0_0 = asfloat(a_packed_0.x);
+        const float a1_0 = asfloat(a_packed_0.y);
+        const float a2_0 = asfloat(a_packed_0.z);
+        const float a3_0 = asfloat(a_packed_0.w);
+        const float dp_0 = mad(float(q0_0), a0_0,
+                           mad(float(q1_0), a1_0,
+                           mad(float(q2_0), a2_0,
+                               float(q3_0) * a3_0)));
+        acc = mad(scale_0, dp_0, acc);
+
+        // ----- compute group 1 -----
+        const int q0_1 = (int)(packed_1 << 24) >> 24;
+        const int q1_1 = (int)(packed_1 << 16) >> 24;
+        const int q2_1 = (int)(packed_1 <<  8) >> 24;
+        const int q3_1 = (int) packed_1         >> 24;
+        const float a0_1 = asfloat(a_packed_1.x);
+        const float a1_1 = asfloat(a_packed_1.y);
+        const float a2_1 = asfloat(a_packed_1.z);
+        const float a3_1 = asfloat(a_packed_1.w);
+        const float dp_1 = mad(float(q0_1), a0_1,
+                           mad(float(q1_1), a1_1,
+                           mad(float(q2_1), a2_1,
+                               float(q3_1) * a3_1)));
+        acc = mad(scale_1, dp_1, acc);
+
+        k += stride2;
+    }
+
+    // Single-iter tail for the odd-iter case (when (K/stride) is odd).
     [loop]
     while (k + 4u <= k_main) {
         const uint block     = k / QK;
@@ -118,14 +190,6 @@ void main(uint3 gid : SV_GroupID, uint3 gtid : SV_GroupThreadID) {
 
         const float scale = load_f16_aligned2(src0_buf, block_off);
 
-        // Load 4 consecutive quant bytes as one packed uint. quants_off
-        // alignment alternates between 0 and 2 (mod 4) depending on block
-        // parity (BLOCK_SIZE=34, QS_OFFSET=2). Branch-free: always do two
-        // aligned Loads and combine. The masked shift `(32u - shift) & 31u`
-        // is paired with a select on `w1` so the shift=0 case yields w0
-        // alone (avoids the HLSL-undefined shift-by-32). DXC compiles this
-        // to a single Load + cmov + Load + funnel-shift sequence with no
-        // intra-warp branch divergence.
         const uint base_word = quants_off & ~3u;
         const uint shift     = (quants_off & 3u) * 8u;
         const uint w0 = src0_buf.Load(base_word);
@@ -133,16 +197,11 @@ void main(uint3 gid : SV_GroupID, uint3 gtid : SV_GroupThreadID) {
         const uint w1_shifted = (shift == 0u) ? 0u : (w1 << (32u - shift));
         const uint packed = (w0 >> shift) | w1_shifted;
 
-        // Sign-extend each byte (Q8_0 stores as int8).
         const int q0 = (int)(packed << 24) >> 24;
         const int q1 = (int)(packed << 16) >> 24;
         const int q2 = (int)(packed <<  8) >> 24;
         const int q3 = (int) packed         >> 24;
 
-        // Load 4 activations as a single 16-byte transaction. vec_base
-        // + k*4 is 16-byte aligned (k is always a multiple of 4 in this
-        // loop; vec_base is at least 4-byte aligned and src1 row strides
-        // are multiples of 16 for F32 vectors of width >= 4).
         const uint4 a_packed = src1_buf.Load4(vec_base + k * 4u);
         const float a0 = asfloat(a_packed.x);
         const float a1 = asfloat(a_packed.y);
