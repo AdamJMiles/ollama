@@ -59,6 +59,13 @@ struct dispatch_ctx {
     bool                         caps_wave_ops    = false;
     bool                         caps_native_fp16 = false;
     bool                         caps_has_dp4a    = false;
+    // Last-bound PSO and root signature; used to elide redundant
+    // SetComputeRootSignature/SetPipelineState calls when consecutive
+    // dispatches reuse the same state. Many graphs alternate between
+    // a small handful of root sigs, and ADD/MUL/RMS_NORM all share
+    // the (uav_count, root_constants) shape.
+    ID3D12PipelineState *        last_pso         = nullptr;
+    ID3D12RootSignature *        last_root_sig    = nullptr;
 };
 
 // Resolved info about a tensor's underlying D3D12 storage.

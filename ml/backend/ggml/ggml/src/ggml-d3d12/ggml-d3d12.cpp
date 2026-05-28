@@ -15,6 +15,7 @@
 
 #include <algorithm>
 #include <atomic>
+#include <chrono>
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
@@ -1337,6 +1338,10 @@ bool ctx_transition(dispatch_ctx & ctx, const ggml_tensor * tensor, D3D12_RESOUR
 
 void ctx_uav_barrier(dispatch_ctx & ctx, const ggml_tensor * tensor) {
     if (ctx.cmd == nullptr) return;
+    // UNSAFE EXPERIMENT: gate UAV barriers behind env var so we can measure
+    // their cost upper bound on the bench. Real code path leaves them on.
+    static const bool skip = std::getenv("GGML_D3D12_SKIP_UAV_BARRIERS") != nullptr;
+    if (skip) return;
     d3d12_buffer * buf = resolve_buffer(tensor);
     if (buf == nullptr || !buf->resource) return;
     D3D12_RESOURCE_BARRIER barrier = {};
@@ -1633,8 +1638,23 @@ bool ctx_bind_compute(dispatch_ctx & ctx,
                       const UINT * constants,
                       uint8_t constants_dwords) {
     if (ctx.cmd == nullptr || pso == nullptr || root_sig == nullptr) return false;
-    ctx.cmd->SetComputeRootSignature(root_sig);
-    ctx.cmd->SetPipelineState(pso);
+    // Elide redundant state-change calls when the same PSO/root sig is
+    // already bound from the previous dispatch. Changing the root
+    // signature also invalidates root parameters in D3D12, so when we
+    // do bind a new root sig the descriptor table + root constants
+    // are always re-set below.
+    if (ctx.last_root_sig != root_sig) {
+        ctx.cmd->SetComputeRootSignature(root_sig);
+        ctx.last_root_sig = root_sig;
+        // Force a fresh PSO bind on next op too: root sig changes can
+        // invalidate cached state in some drivers and this is cheap
+        // anyway.
+        ctx.last_pso = nullptr;
+    }
+    if (ctx.last_pso != pso) {
+        ctx.cmd->SetPipelineState(pso);
+        ctx.last_pso = pso;
+    }
     if (uav_count > 0) {
         const UINT slot = root_sig_cache::uav_table_param_index(uav_count);
         if (slot == UINT_MAX) return false;
@@ -1704,6 +1724,15 @@ static enum ggml_status ggml_backend_d3d12_graph_compute(ggml_backend_t backend,
     // per graph * 3 graphs/decode-token = 2200+ env lookups/token before).
     const bool log_ops = std::getenv("GGML_D3D12_LOG_OPS") != nullptr;
 
+    // Optional per-graph timing breakdown: t_record (CPU walltime spent
+    // dispatching ops) and t_wait (walltime from ExecuteCommandLists to
+    // fence completion, i.e. GPU exec + driver sync). Enable with
+    // GGML_D3D12_PROFILE=1 to attribute remaining decode overhead.
+    static const bool profile = std::getenv("GGML_D3D12_PROFILE") != nullptr;
+    static const bool profile_ops = std::getenv("GGML_D3D12_PROFILE_OPS") != nullptr;
+    const auto record_start = profile ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
+    int op_counts[GGML_OP_COUNT] = {0};
+
     for (int i = 0; i < cgraph->n_nodes; ++i) {
         ggml_tensor * node = cgraph->nodes[i];
         if (node == nullptr) continue;
@@ -1718,6 +1747,10 @@ static enum ggml_status ggml_backend_d3d12_graph_compute(ggml_backend_t backend,
                 continue;
             default:
                 break;
+        }
+
+        if (profile_ops && node->op >= 0 && node->op < GGML_OP_COUNT) {
+            op_counts[node->op]++;
         }
 
         // Debug: dump every op we process. Enable with GGML_D3D12_LOG_OPS=1.
@@ -1760,11 +1793,33 @@ static enum ggml_status ggml_backend_d3d12_graph_compute(ggml_backend_t backend,
         }
     }
 
+    const auto record_end = profile ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
     if (!d3d12_end_commands_and_wait_locked(dev)) {
         return GGML_STATUS_FAILED;
     }
     dev->uav_heap.mark_used(dev->fence_value.load());
     dev->uav_heap.reclaim_to(dev->fence_value.load());
+
+    if (profile) {
+        const auto wait_end = std::chrono::steady_clock::now();
+        const double t_record_ms = std::chrono::duration<double, std::milli>(record_end - record_start).count();
+        const double t_wait_ms   = std::chrono::duration<double, std::milli>(wait_end - record_end).count();
+        const double t_total_ms  = std::chrono::duration<double, std::milli>(wait_end - record_start).count();
+        GGML_LOG_INFO("ggml_d3d12: graph nodes=%d record=%.2fms wait=%.2fms total=%.2fms\n",
+                      cgraph->n_nodes, t_record_ms, t_wait_ms, t_total_ms);
+    }
+    if (profile_ops) {
+        std::string buf;
+        buf.reserve(256);
+        for (int op = 0; op < GGML_OP_COUNT; ++op) {
+            if (op_counts[op] > 0) {
+                char tmp[64];
+                snprintf(tmp, sizeof(tmp), " %s=%d", ggml_op_name((ggml_op)op), op_counts[op]);
+                buf += tmp;
+            }
+        }
+        GGML_LOG_INFO("ggml_d3d12: graph ops:%s\n", buf.c_str());
+    }
 
     return GGML_STATUS_SUCCESS;
 #endif
