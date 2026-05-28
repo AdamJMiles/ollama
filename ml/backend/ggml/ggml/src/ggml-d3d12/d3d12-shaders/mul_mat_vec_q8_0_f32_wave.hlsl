@@ -90,13 +90,13 @@ void main(uint3 gid : SV_GroupID, uint3 gtid : SV_GroupThreadID) {
     // k = warp_base + i*4 .. i*4+3):
     //   - quant bytes: lanes 0..7 share one Q8_0 block (32 quant bytes,
     //     fully coalesced). Lanes 8..15 share the next block, etc.
-    //     Driver coalesces the 4 byte loads per lane into one word load
-    //     (offset is always multiple of 4 within the block).
-    //   - activations: lanes read contiguous 4-float chunks → vec4-friendly.
-    //   - scale: lanes 0..7 broadcast-read the same f16 (one memory txn).
-    //
-    // Net: ~4x fewer scale loads vs the per-quant variant, same coalesce,
-    // FMAs grouped 4-wide so the compiler can schedule them in parallel.
+    //     The 4 byte loads per lane are issued as a single uint Load
+    //     (and one extra Load for the 2-byte-misaligned case where the
+    //     block straddles a 4-byte word boundary).
+    //   - activations: lanes read contiguous 4-float chunks via Load4,
+    //     fully coalesced into a single 16-byte transaction per lane.
+    //   - scale: lanes 0..7 broadcast-read the same f16 (one memory txn
+    //     coalesced by the driver).
     const uint stride = TG * 4u;
     const uint k_main = K & ~3u;
     uint k = gtid.x * 4u;
@@ -109,26 +109,38 @@ void main(uint3 gid : SV_GroupID, uint3 gtid : SV_GroupThreadID) {
 
         const float scale = load_f16(src0_buf, block_off);
 
-        // 4 contiguous quant bytes. quants_off is always 4-byte aligned
-        // because elem is a multiple of 4 and (row_base + block*34 + 2)
-        // alignment cancels: 34*block + 2 ≡ 2*(block+1) (mod 4), so
-        // quants_off ≡ row_base + 2*(block+1) + 4*(elem/4) (mod 4). The
-        // residue can be 0/2, so we may still be 2-aligned not 4-aligned —
-        // fall back to load_u8 quartet which the driver coalesces.
-        const uint b0 = load_u8(src0_buf, quants_off + 0u);
-        const uint b1 = load_u8(src0_buf, quants_off + 1u);
-        const uint b2 = load_u8(src0_buf, quants_off + 2u);
-        const uint b3 = load_u8(src0_buf, quants_off + 3u);
+        // Load 4 consecutive quant bytes as one packed uint. quants_off
+        // alignment alternates between 0 and 2 (mod 4) depending on block
+        // parity (BLOCK_SIZE=34, QS_OFFSET=2). Handle both cases without
+        // branching: always do two aligned Loads and combine. On the
+        // aligned case the second Load is dead-code-eliminated as its
+        // value isn't used.
+        const uint base_word = quants_off & ~3u;
+        const uint shift     = (quants_off & 3u) * 8u;
+        uint packed;
+        if (shift == 0u) {
+            packed = src0_buf.Load(base_word);
+        } else {
+            const uint w0 = src0_buf.Load(base_word);
+            const uint w1 = src0_buf.Load(base_word + 4u);
+            packed = (w0 >> shift) | (w1 << (32u - shift));
+        }
 
-        const int q0 = (int(b0) << 24) >> 24;
-        const int q1 = (int(b1) << 24) >> 24;
-        const int q2 = (int(b2) << 24) >> 24;
-        const int q3 = (int(b3) << 24) >> 24;
+        // Sign-extend each byte (Q8_0 stores as int8).
+        const int q0 = (int)(packed << 24) >> 24;
+        const int q1 = (int)(packed << 16) >> 24;
+        const int q2 = (int)(packed <<  8) >> 24;
+        const int q3 = (int) packed         >> 24;
 
-        const float a0 = asfloat(src1_buf.Load(vec_base + (k + 0u) * 4u));
-        const float a1 = asfloat(src1_buf.Load(vec_base + (k + 1u) * 4u));
-        const float a2 = asfloat(src1_buf.Load(vec_base + (k + 2u) * 4u));
-        const float a3 = asfloat(src1_buf.Load(vec_base + (k + 3u) * 4u));
+        // Load 4 activations as a single 16-byte transaction. vec_base
+        // + k*4 is 16-byte aligned (k is always a multiple of 4 in this
+        // loop; vec_base is at least 4-byte aligned and src1 row strides
+        // are multiples of 16 for F32 vectors of width >= 4).
+        const uint4 a_packed = src1_buf.Load4(vec_base + k * 4u);
+        const float a0 = asfloat(a_packed.x);
+        const float a1 = asfloat(a_packed.y);
+        const float a2 = asfloat(a_packed.z);
+        const float a3 = asfloat(a_packed.w);
 
         const float dp = mad(float(q0), a0,
                          mad(float(q1), a1,
