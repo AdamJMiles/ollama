@@ -110,14 +110,14 @@ void main(uint3 gid : SV_GroupID, uint3 gtid : SV_GroupThreadID) {
     const uint k_main = K & ~3u;
     uint k = gtid.x * 4u;
 
-    // Manually unrolled by 2: each iteration issues all loads for two
+    // Manually unrolled by 4: each iteration issues all loads for four
     // groups of 4 quants before doing any MACs. The interleaved loads
     // give the hardware more memory parallelism to hide latency, which
     // matters especially for the large-K case (K=18944) where per-WG
     // activation footprint exceeds the L1 working set.
-    const uint stride2 = stride * 2u;
+    const uint stride4 = stride * 4u;
     [loop]
-    while (k + stride + 4u <= k_main) {
+    while (k + stride * 3u + 4u <= k_main) {
         // ----- group 0 @ k -----
         const uint block_0     = k / QK;
         const uint elem_0      = k & (QK - 1u);
@@ -147,40 +147,68 @@ void main(uint3 gid : SV_GroupID, uint3 gtid : SV_GroupThreadID) {
         const float scale_1 = load_f16_aligned2(src0_buf, block_off_1);
         const uint4 a_packed_1 = src1_buf.Load4(vec_base + k1 * 4u);
 
+        // ----- group 2 @ k + 2*stride -----
+        const uint k2 = k + stride * 2u;
+        const uint block_2     = k2 / QK;
+        const uint elem_2      = k2 & (QK - 1u);
+        const uint block_off_2 = row_base + block_2 * BLOCK_SIZE;
+        const uint quants_off_2 = block_off_2 + QS_OFFSET + elem_2;
+        const uint base_word_2 = quants_off_2 & ~3u;
+        const uint shift_2     = (quants_off_2 & 3u) * 8u;
+        const uint w0_2 = src0_buf.Load(base_word_2);
+        const uint w1_2 = src0_buf.Load(base_word_2 + 4u);
+        const uint w1s_2 = (shift_2 == 0u) ? 0u : (w1_2 << (32u - shift_2));
+        const uint packed_2 = (w0_2 >> shift_2) | w1s_2;
+        const float scale_2 = load_f16_aligned2(src0_buf, block_off_2);
+        const uint4 a_packed_2 = src1_buf.Load4(vec_base + k2 * 4u);
+
+        // ----- group 3 @ k + 3*stride -----
+        const uint k3 = k + stride * 3u;
+        const uint block_3     = k3 / QK;
+        const uint elem_3      = k3 & (QK - 1u);
+        const uint block_off_3 = row_base + block_3 * BLOCK_SIZE;
+        const uint quants_off_3 = block_off_3 + QS_OFFSET + elem_3;
+        const uint base_word_3 = quants_off_3 & ~3u;
+        const uint shift_3     = (quants_off_3 & 3u) * 8u;
+        const uint w0_3 = src0_buf.Load(base_word_3);
+        const uint w1_3 = src0_buf.Load(base_word_3 + 4u);
+        const uint w1s_3 = (shift_3 == 0u) ? 0u : (w1_3 << (32u - shift_3));
+        const uint packed_3 = (w0_3 >> shift_3) | w1s_3;
+        const float scale_3 = load_f16_aligned2(src0_buf, block_off_3);
+        const uint4 a_packed_3 = src1_buf.Load4(vec_base + k3 * 4u);
+
         // ----- compute group 0 -----
-        const int q0_0 = (int)(packed_0 << 24) >> 24;
-        const int q1_0 = (int)(packed_0 << 16) >> 24;
-        const int q2_0 = (int)(packed_0 <<  8) >> 24;
-        const int q3_0 = (int) packed_0         >> 24;
-        const float a0_0 = asfloat(a_packed_0.x);
-        const float a1_0 = asfloat(a_packed_0.y);
-        const float a2_0 = asfloat(a_packed_0.z);
-        const float a3_0 = asfloat(a_packed_0.w);
-        const float dp_0 = mad(float(q0_0), a0_0,
-                           mad(float(q1_0), a1_0,
-                           mad(float(q2_0), a2_0,
-                               float(q3_0) * a3_0)));
+        const float dp_0 = mad(float((int)(packed_0 << 24) >> 24), asfloat(a_packed_0.x),
+                           mad(float((int)(packed_0 << 16) >> 24), asfloat(a_packed_0.y),
+                           mad(float((int)(packed_0 <<  8) >> 24), asfloat(a_packed_0.z),
+                               float((int) packed_0         >> 24) * asfloat(a_packed_0.w))));
         acc = mad(scale_0, dp_0, acc);
 
         // ----- compute group 1 -----
-        const int q0_1 = (int)(packed_1 << 24) >> 24;
-        const int q1_1 = (int)(packed_1 << 16) >> 24;
-        const int q2_1 = (int)(packed_1 <<  8) >> 24;
-        const int q3_1 = (int) packed_1         >> 24;
-        const float a0_1 = asfloat(a_packed_1.x);
-        const float a1_1 = asfloat(a_packed_1.y);
-        const float a2_1 = asfloat(a_packed_1.z);
-        const float a3_1 = asfloat(a_packed_1.w);
-        const float dp_1 = mad(float(q0_1), a0_1,
-                           mad(float(q1_1), a1_1,
-                           mad(float(q2_1), a2_1,
-                               float(q3_1) * a3_1)));
+        const float dp_1 = mad(float((int)(packed_1 << 24) >> 24), asfloat(a_packed_1.x),
+                           mad(float((int)(packed_1 << 16) >> 24), asfloat(a_packed_1.y),
+                           mad(float((int)(packed_1 <<  8) >> 24), asfloat(a_packed_1.z),
+                               float((int) packed_1         >> 24) * asfloat(a_packed_1.w))));
         acc = mad(scale_1, dp_1, acc);
 
-        k += stride2;
+        // ----- compute group 2 -----
+        const float dp_2 = mad(float((int)(packed_2 << 24) >> 24), asfloat(a_packed_2.x),
+                           mad(float((int)(packed_2 << 16) >> 24), asfloat(a_packed_2.y),
+                           mad(float((int)(packed_2 <<  8) >> 24), asfloat(a_packed_2.z),
+                               float((int) packed_2         >> 24) * asfloat(a_packed_2.w))));
+        acc = mad(scale_2, dp_2, acc);
+
+        // ----- compute group 3 -----
+        const float dp_3 = mad(float((int)(packed_3 << 24) >> 24), asfloat(a_packed_3.x),
+                           mad(float((int)(packed_3 << 16) >> 24), asfloat(a_packed_3.y),
+                           mad(float((int)(packed_3 <<  8) >> 24), asfloat(a_packed_3.z),
+                               float((int) packed_3         >> 24) * asfloat(a_packed_3.w))));
+        acc = mad(scale_3, dp_3, acc);
+
+        k += stride4;
     }
 
-    // Single-iter tail for the odd-iter case (when (K/stride) is odd).
+    // Tail handler for groups of 1 (up to 3 remaining unrolled iters).
     [loop]
     while (k + 4u <= k_main) {
         const uint block     = k / QK;
