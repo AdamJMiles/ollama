@@ -87,6 +87,28 @@ inline const char * mulmatvec_shader_name(ggml_type type, bool native_fp16, bool
     }
 }
 
+// Pick the NUM_ROWS=2 wave variant when it's profitable: only Q8_0, only when
+// the wave path is active, and only when M is large enough that halving the
+// WG count still saturates GPU occupancy. The NR2 variant SHARES activation
+// loads across two consecutive output rows, but on RTX 3090 Ti (and likely
+// any modern GPU with a meaningful L2 cache) the L1/L2 cache already absorbs
+// repeated activation reads across WGs. Measured regression of ~7% on the
+// Qwen2.5-7B Q8_0 decode workload — extra per-thread register pressure
+// (two accumulators, two sets of quants, divergent have_m1 checks) outweighs
+// the bandwidth savings. Kept opt-in via env var for further A/B experiments.
+inline bool mulmatvec_env_enable_nr2() {
+    static const bool v = std::getenv("GGML_D3D12_ENABLE_MMV_NR2") != nullptr;
+    return v;
+}
+
+inline bool mulmatvec_should_use_nr2(ggml_type type, bool use_wave, uint64_t M) {
+    if (!mulmatvec_env_enable_nr2()) return false;
+    if (!use_wave) return false;
+    if (type != GGML_TYPE_Q8_0) return false;
+    if (M < 2048) return false;
+    return true;
+}
+
 inline bool mulmatvec_fits_u32(uint64_t value) {
     return value <= static_cast<uint64_t>(std::numeric_limits<UINT>::max());
 }
@@ -148,14 +170,20 @@ inline bool dispatch_mulmatvec(dispatch_ctx & ctx, const ggml_tensor * node) {
     const ggml_tensor * src0 = node->src[0];
     const ggml_tensor * src1 = node->src[1];
     const bool dp4a_disabled = mulmatvec_dp4a_disabled();
+    const bool use_wave = mulmatvec_wave_enabled(ctx);
     const char * shader = mulmatvec_shader_name(src0->type,
                                                 mulmatvec_fp16_enabled(ctx),
-                                                mulmatvec_wave_enabled(ctx),
+                                                use_wave,
                                                 mulmatvec_dp4a_enabled(ctx, dp4a_disabled));
     if (shader == nullptr) return true;
 
     const uint64_t K = static_cast<uint64_t>(src0->ne[0]);
     const uint64_t M = static_cast<uint64_t>(src0->ne[1]);
+
+    const bool use_nr2 = mulmatvec_should_use_nr2(src0->type, use_wave, M);
+    if (use_nr2) {
+        shader = "mul_mat_vec_q8_0_f32_wave_nr2";
+    }
     const uint64_t ne2 = static_cast<uint64_t>(src1->ne[2]);
     const uint64_t batch = ne2 * static_cast<uint64_t>(src1->ne[3]);
     if (K == 0 || M == 0 || batch == 0) return true;
@@ -228,7 +256,7 @@ inline bool dispatch_mulmatvec(dispatch_ctx & ctx, const ggml_tensor * node) {
     };
     if (!ctx_bind_compute(ctx, pso, root_sig, uav_table, 3, consts, 18)) return true;
 
-    ctx_dispatch_groups(ctx, static_cast<UINT>(M), static_cast<UINT>(batch), 1);
+    ctx_dispatch_groups(ctx, use_nr2 ? static_cast<UINT>((M + 1u) / 2u) : static_cast<UINT>(M), static_cast<UINT>(batch), 1);
     ctx_uav_barrier(ctx, node);
     return true;
 }

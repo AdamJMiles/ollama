@@ -37,6 +37,15 @@ uint load_u16(RWByteAddressBuffer buf, uint off) {
     return load_u8(buf, off) | (load_u8(buf, off + 1u) << 8u);
 }
 
+// Single-uint scale load. block_off is guaranteed to be 2-byte aligned, so the
+// 16-bit half-float scale always fits inside one 4-byte word — saves one Load
+// vs the byte-wise load_u16 path.
+float load_f16_aligned2(RWByteAddressBuffer buf, uint off) {
+    const uint word = buf.Load(off & ~3u);
+    const uint half = (word >> ((off & 3u) * 8u)) & 0xFFFFu;
+    return f16tof32(half);
+}
+
 float load_f16(RWByteAddressBuffer buf, uint off) {
     return f16tof32(load_u16(buf, off));
 }
@@ -107,24 +116,22 @@ void main(uint3 gid : SV_GroupID, uint3 gtid : SV_GroupThreadID) {
         const uint block_off = row_base + block * BLOCK_SIZE;
         const uint quants_off = block_off + QS_OFFSET + elem;
 
-        const float scale = load_f16(src0_buf, block_off);
+        const float scale = load_f16_aligned2(src0_buf, block_off);
 
         // Load 4 consecutive quant bytes as one packed uint. quants_off
         // alignment alternates between 0 and 2 (mod 4) depending on block
-        // parity (BLOCK_SIZE=34, QS_OFFSET=2). Handle both cases without
-        // branching: always do two aligned Loads and combine. On the
-        // aligned case the second Load is dead-code-eliminated as its
-        // value isn't used.
+        // parity (BLOCK_SIZE=34, QS_OFFSET=2). Branch-free: always do two
+        // aligned Loads and combine. The masked shift `(32u - shift) & 31u`
+        // is paired with a select on `w1` so the shift=0 case yields w0
+        // alone (avoids the HLSL-undefined shift-by-32). DXC compiles this
+        // to a single Load + cmov + Load + funnel-shift sequence with no
+        // intra-warp branch divergence.
         const uint base_word = quants_off & ~3u;
         const uint shift     = (quants_off & 3u) * 8u;
-        uint packed;
-        if (shift == 0u) {
-            packed = src0_buf.Load(base_word);
-        } else {
-            const uint w0 = src0_buf.Load(base_word);
-            const uint w1 = src0_buf.Load(base_word + 4u);
-            packed = (w0 >> shift) | (w1 << (32u - shift));
-        }
+        const uint w0 = src0_buf.Load(base_word);
+        const uint w1 = src0_buf.Load(base_word + 4u);
+        const uint w1_shifted = (shift == 0u) ? 0u : (w1 << (32u - shift));
+        const uint packed = (w0 >> shift) | w1_shifted;
 
         // Sign-extend each byte (Q8_0 stores as int8).
         const int q0 = (int)(packed << 24) >> 24;
