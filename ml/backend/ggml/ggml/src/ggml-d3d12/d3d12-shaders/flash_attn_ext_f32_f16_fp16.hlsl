@@ -1,5 +1,6 @@
 #define TG_SIZE 64
 #define MAX_KV 4096u
+#define MAX_D 256u
 
 RWByteAddressBuffer q_buf    : register(u0);
 RWByteAddressBuffer k_buf    : register(u1);
@@ -32,6 +33,7 @@ cbuffer Params : register(b0) {
 };
 
 groupshared float s_buf[MAX_KV];
+groupshared half q_cache[MAX_D];
 groupshared float reduce_max[TG_SIZE];
 groupshared float reduce_sum[TG_SIZE];
 
@@ -61,6 +63,10 @@ half v_load(uint d, uint j, uint h_kv) {
 }
 
 float mask_load(uint j, uint i) {
+    const bool is_f16 = (flags & 2u) != 0u;
+    if (is_f16) {
+        return f16tof32((uint)load_u16(mask_buf, mask_off + i * mask_nb1 + j * 2u));
+    }
     return asfloat(mask_buf.Load(mask_off + i * mask_nb1 + j * 4u));
 }
 
@@ -79,11 +85,16 @@ void main(uint3 gid : SV_GroupID, uint3 gtid : SV_GroupThreadID) {
     const float scale = asfloat(scale_bits);
     const bool has_mask = (flags & 1u) != 0u;
 
+    for (uint d = tid; d < D; d += TG_SIZE) {
+        q_cache[d] = (half)q_load(d, i, h);
+    }
+    GroupMemoryBarrierWithGroupSync();
+
     for (uint j = tid; j < nkv; j += TG_SIZE) {
         float dot = 0.0f;
         for (uint d = 0; d < D; ++d) {
             const half k = k_load(d, j, h_kv);
-            dot += q_load(d, i, h) * (float)k;
+            dot += (float)(q_cache[d] * k);
         }
         float s = dot * scale;
         if (has_mask) {

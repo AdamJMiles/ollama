@@ -109,9 +109,16 @@ inline bool supports_op_attention(const ggml_tensor * op) {
     if (prec != GGML_PREC_DEFAULT && prec != GGML_PREC_F32) return false;
 
     if (mask != nullptr) {
-        if (mask->type != GGML_TYPE_F32) return false;
+        if (mask->type != GGML_TYPE_F32 && mask->type != GGML_TYPE_F16) return false;
         if (mask->nb[0] != ggml_type_size(mask->type)) return false;
         if (mask->ne[0] < nkv || mask->ne[1] < nq || mask->ne[2] != 1 || mask->ne[3] != 1) return false;
+        // The current decode-time kernel is slower than the explicit
+        // mul_mat_vec + softmax chain for the F16-mask decode shape until
+        // the kernel is tuned; keep it opt-in.
+        if (mask->type == GGML_TYPE_F16 &&
+            std::getenv("GGML_D3D12_ENABLE_FA_F16_MASK") == nullptr) {
+            return false;
+        }
     }
 
     if (!attention_fits_u32(static_cast<uint64_t>(D)) || !attention_fits_u32(static_cast<uint64_t>(nq)) ||
@@ -171,7 +178,8 @@ inline bool dispatch_attention(dispatch_ctx & ctx, const ggml_tensor * node) {
     if ((qr.offset_bytes % 4) != 0 || (dr.offset_bytes % 4) != 0) return true;
     if (k->type == GGML_TYPE_F32 && (kr.offset_bytes % 4) != 0) return true;
     if (v->type == GGML_TYPE_F32 && (vr.offset_bytes % 4) != 0) return true;
-    if (mask != nullptr && (mr.offset_bytes % 4) != 0) return true;
+    if (mask != nullptr && mask->type == GGML_TYPE_F32 && (mr.offset_bytes % 4) != 0) return true;
+    if (mask != nullptr && mask->type == GGML_TYPE_F16 && (mr.offset_bytes % 2) != 0) return true;
 
     if (!ctx_transition(ctx, q, D3D12_RESOURCE_STATE_UNORDERED_ACCESS)) return true;
     if (!ctx_transition(ctx, k, D3D12_RESOURCE_STATE_UNORDERED_ACCESS)) return true;
@@ -193,6 +201,8 @@ inline bool dispatch_attention(dispatch_ctx & ctx, const ggml_tensor * node) {
     if (pso == nullptr) return true;
 
     const float scale = attention_param_f32(node, 0);
+    const UINT mask_is_f16 = (mask != nullptr && mask->type == GGML_TYPE_F16) ? 1u : 0u;
+    const UINT flags = (mask != nullptr ? 1u : 0u) | (mask_is_f16 << 1);
     const UINT consts[21] = {
         static_cast<UINT>(D),
         static_cast<UINT>(nq),
@@ -213,7 +223,7 @@ inline bool dispatch_attention(dispatch_ctx & ctx, const ggml_tensor * node) {
         static_cast<UINT>(node->nb[1]),
         static_cast<UINT>(node->nb[2]),
         mask != nullptr ? static_cast<UINT>(mask->nb[1]) : 0u,
-        mask != nullptr ? 1u : 0u,
+        flags,
         attention_f32_bits(scale),
     };
     if (!ctx_bind_compute(ctx, pso, root_sig, uav_table, 5, consts, 21)) return true;

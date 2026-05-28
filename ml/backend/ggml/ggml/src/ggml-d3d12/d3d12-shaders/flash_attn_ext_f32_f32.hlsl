@@ -1,5 +1,6 @@
 #define TG_SIZE 64
 #define MAX_KV 4096u
+#define MAX_D 256u
 
 RWByteAddressBuffer q_buf    : register(u0);
 RWByteAddressBuffer k_buf    : register(u1);
@@ -32,6 +33,7 @@ cbuffer Params : register(b0) {
 };
 
 groupshared float s_buf[MAX_KV];
+groupshared float q_cache[MAX_D];
 groupshared float reduce_max[TG_SIZE];
 groupshared float reduce_sum[TG_SIZE];
 
@@ -47,7 +49,18 @@ float v_load(uint d, uint j, uint h_kv) {
     return asfloat(v_buf.Load(v_off + j * v_nb1 + h_kv * v_nb2 + d * 4u));
 }
 
+uint load_u8_mask(RWByteAddressBuffer buf, uint off) {
+    const uint word = buf.Load(off & ~3u);
+    return (word >> ((off & 3u) * 8u)) & 0xFFu;
+}
+
 float mask_load(uint j, uint i) {
+    const bool is_f16 = (flags & 2u) != 0u;
+    if (is_f16) {
+        const uint addr = mask_off + i * mask_nb1 + j * 2u;
+        const uint half_bits = load_u8_mask(mask_buf, addr) | (load_u8_mask(mask_buf, addr + 1u) << 8u);
+        return f16tof32(half_bits);
+    }
     return asfloat(mask_buf.Load(mask_off + i * mask_nb1 + j * 4u));
 }
 
@@ -66,10 +79,17 @@ void main(uint3 gid : SV_GroupID, uint3 gtid : SV_GroupThreadID) {
     const float scale = asfloat(scale_bits);
     const bool has_mask = (flags & 1u) != 0u;
 
+    // Cache q[d, i, h] for d in [0, D) so the per-j inner loop reads q from
+    // groupshared instead of UAV.
+    for (uint d = tid; d < D; d += TG_SIZE) {
+        q_cache[d] = q_load(d, i, h);
+    }
+    GroupMemoryBarrierWithGroupSync();
+
     for (uint j = tid; j < nkv; j += TG_SIZE) {
         float dot = 0.0f;
         for (uint d = 0; d < D; ++d) {
-            dot += q_load(d, i, h) * k_load(d, j, h_kv);
+            dot += q_cache[d] * k_load(d, j, h_kv);
         }
         float s = dot * scale;
         if (has_mask) {
