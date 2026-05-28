@@ -1910,6 +1910,26 @@ static bool ggml_backend_d3d12_device_supports_op(ggml_backend_dev_t dev, const 
     if (ggml_d3d12::supports_op_mulmatvec(op))  return true;
     // === end op support checks ===
 
+    if (std::getenv("GGML_D3D12_LOG_UNSUPPORTED")) {
+        const ggml_tensor * s0 = op->src[0];
+        const ggml_tensor * s1 = op->src[1];
+        const ggml_tensor * s2 = op->src[2];
+        const ggml_tensor * s3 = op->src[3];
+        char s0sh[64] = "", s1sh[64] = "", s2sh[64] = "", s3sh[64] = "";
+        if (s0) snprintf(s0sh, sizeof(s0sh), "[%lld,%lld,%lld,%lld]", (long long)s0->ne[0], (long long)s0->ne[1], (long long)s0->ne[2], (long long)s0->ne[3]);
+        if (s1) snprintf(s1sh, sizeof(s1sh), "[%lld,%lld,%lld,%lld]", (long long)s1->ne[0], (long long)s1->ne[1], (long long)s1->ne[2], (long long)s1->ne[3]);
+        if (s2) snprintf(s2sh, sizeof(s2sh), "[%lld,%lld,%lld,%lld]", (long long)s2->ne[0], (long long)s2->ne[1], (long long)s2->ne[2], (long long)s2->ne[3]);
+        if (s3) snprintf(s3sh, sizeof(s3sh), "[%lld,%lld,%lld,%lld]", (long long)s3->ne[0], (long long)s3->ne[1], (long long)s3->ne[2], (long long)s3->ne[3]);
+        GGML_LOG_INFO("ggml_d3d12: UNSUPPORTED op=%s dst[%lld,%lld,%lld,%lld] type=%s%s%s%s%s%s%s%s%s%s%s%s%s\n",
+            ggml_op_name(op->op),
+            (long long)op->ne[0], (long long)op->ne[1], (long long)op->ne[2], (long long)op->ne[3],
+            ggml_type_name(op->type),
+            s0 ? " s0=" : "", s0 ? ggml_type_name(s0->type) : "", s0sh,
+            s1 ? " s1=" : "", s1 ? ggml_type_name(s1->type) : "", s1sh,
+            s2 ? " s2=" : "", s2 ? ggml_type_name(s2->type) : "", s2sh,
+            s3 ? " s3=" : "", s3 ? ggml_type_name(s3->type) : "", s3sh);
+    }
+
     return false;
 }
 
