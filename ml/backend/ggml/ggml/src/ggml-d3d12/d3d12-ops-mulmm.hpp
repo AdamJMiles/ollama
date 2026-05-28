@@ -109,12 +109,14 @@ inline bool supports_op_mulmm(const ggml_tensor * op) {
     if (!ggml_is_contiguous(src0) && !mulmm_row_contiguous(src0)) return false;
     if (!mulmm_row_contiguous(src0)) return false;
 
-    // Q8_0 path uses a 64x64 output tile (mul_mm_q8_0_f32.hlsl); F32/F16
-    // paths still use 32x32. supports_op_mulmm must use the same tile size
-    // as dispatch_mulmm so the dispatch-dim sanity check matches the shader.
-    const uint64_t tile = (src0->type == GGML_TYPE_Q8_0) ? 64u : 32u;
-    const uint64_t gx = (static_cast<uint64_t>(op->ne[1]) + tile - 1u) / tile;
-    const uint64_t gy = (static_cast<uint64_t>(op->ne[0]) + tile - 1u) / tile;
+    // Q8_0 path uses a 128x64 output tile (mul_mm_q8_0_f32.hlsl, gy=ceil(M/128),
+    // gx=ceil(N/64)); F32/F16 paths still use 32x32. supports_op_mulmm must
+    // use the same tile size as dispatch_mulmm so the dispatch-dim sanity
+    // check matches the shader.
+    const uint64_t tile_m = (src0->type == GGML_TYPE_Q8_0) ? 128u : 32u;
+    const uint64_t tile_n = (src0->type == GGML_TYPE_Q8_0) ? 64u  : 32u;
+    const uint64_t gx = (static_cast<uint64_t>(op->ne[1]) + tile_n - 1u) / tile_n;
+    const uint64_t gy = (static_cast<uint64_t>(op->ne[0]) + tile_m - 1u) / tile_m;
     const uint64_t gz = static_cast<uint64_t>(src1->ne[2]) * static_cast<uint64_t>(src1->ne[3]);
     return mulmm_dispatch_dim(gx) && mulmm_dispatch_dim(gy) && mulmm_dispatch_dim(gz);
 }
@@ -145,10 +147,12 @@ inline bool dispatch_mulmm(dispatch_ctx & ctx, const ggml_tensor * node) {
     const uint64_t batch = batch_ne2 * static_cast<uint64_t>(src1->ne[3]);
     const uint64_t broadcast2 = static_cast<uint64_t>(src1->ne[2]) / static_cast<uint64_t>(src0->ne[2]);
     const uint64_t broadcast3 = static_cast<uint64_t>(src1->ne[3]) / static_cast<uint64_t>(src0->ne[3]);
-    // Q8_0 shader uses a 64x64 output tile; F32/F16 shaders use 32x32.
-    const uint64_t tile = (src0->type == GGML_TYPE_Q8_0) ? 64u : 32u;
-    const uint64_t gx = (N + tile - 1u) / tile;
-    const uint64_t gy = (M + tile - 1u) / tile;
+    // Q8_0 shader uses a 128x64 output tile (gy=ceil(M/128), gx=ceil(N/64));
+    // F32/F16 shaders use 32x32.
+    const uint64_t tile_m = (src0->type == GGML_TYPE_Q8_0) ? 128u : 32u;
+    const uint64_t tile_n = (src0->type == GGML_TYPE_Q8_0) ? 64u  : 32u;
+    const uint64_t gx = (N + tile_n - 1u) / tile_n;
+    const uint64_t gy = (M + tile_m - 1u) / tile_m;
     const uint64_t gz = batch;
     if (!mulmm_dispatch_dim(gx) || !mulmm_dispatch_dim(gy) || !mulmm_dispatch_dim(gz)) {
         return true;

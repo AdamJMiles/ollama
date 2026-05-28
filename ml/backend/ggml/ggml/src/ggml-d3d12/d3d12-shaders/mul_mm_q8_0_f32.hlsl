@@ -1,22 +1,27 @@
 // Q8_0 weight × F32 activation tiled matmul.
 //
-// Output tile: 64x64 per WG. Dispatcher in d3d12-ops-mulmm.hpp uses
-// gx=ceil(N/64), gy=ceil(M/64) for this shader (was 32 before).
+// Output tile: 128x64 per WG. Dispatcher in d3d12-ops-mulmm.hpp uses
+// gx=ceil(N/64), gy=ceil(M/128) for this shader.
 //
-// Layout: 256 threads/WG arranged 16x16, each accumulates a 4x4 sub-tile
+// Layout: 512 threads/WG arranged 32x16, each accumulates a 4x4 sub-tile
 // of outputs. TK=32 matches one full Q8_0 block, so each cooperative load
 // pulls exactly one block per row (one f16 scale + 32 int8 quants).
 //
-// Bigger tile vs the 32x32 variant: each WG processes 4x more outputs,
-// roughly halving the activation/weight re-reads across WGs for the same
-// total output volume. Trade-off: 16 KB groupshared (vs 4 KB), 256
-// threads/WG (vs 64), so a few-times fewer WGs in flight per SM.
+// Wider M tile halves src1 (activation) re-reads across the M dimension
+// (gy = ceil(M/128) vs ceil(M/64)). Per-thread compute, per-thread
+// groupshared reads, and per-thread accumulators are unchanged (still
+// 4x4 = 16 outputs/thread). Groupshared grows from ~16 KB to ~25 KB
+// (sa = 128 * 33 * 4 = 16896 B; sb = 32 * 64 * 4 = 8192 B). Still
+// well under Ampere's 99 KB per-block limit, but block-per-SM
+// concurrency drops from 6 (256-thread) to 3 (512-thread) due to the
+// 1536-thread-per-SM cap.
 //
 // Loads per WG per k0 iter:
-//   sa: 64 rows x 32 quants = 2048 quants. tid = row*4 + quarter;
+//   sa: 128 rows x 32 quants = 4096 quants. tid = row*4 + quarter;
 //       each thread loads 8 quants of one row via 2-3 packed dword loads.
-//   sb: 32 K x 64 cols = 2048 floats. tid = col*4 + quarter;
-//       each thread loads 8 consecutive K-elements of one col via 2 Load4s.
+//       512 threads cover 128 rows x 4 quarters exactly.
+//   sb: 32 K x 64 cols = 2048 floats. With 512 threads each loads
+//       1 Load4: tid = col*8 + chunk; sb_k_base = chunk*4 (0..28).
 //
 // Compute per thread per k0 iter:
 //   32 unrolled k-steps, each doing 4 sa-reads + 4 sb-reads + 16 MACs.
@@ -25,14 +30,14 @@
 // sa is padded as [TM][TK+1] to break the stride-32 bank conflict pattern
 // when threads read 4 consecutive m-rows for the same k.
 
-#define TM       64u
+#define TM      128u
 #define TN       64u
 #define TK       32u    // == Q8_0 block size
 #define TM_PER    4u
 #define TN_PER    4u
-#define TG_M     16u    // threads in M dim (TM = TM_PER * TG_M)
+#define TG_M     32u    // threads in M dim (TM = TM_PER * TG_M)
 #define TG_N     16u    // threads in N dim (TN = TN_PER * TG_N)
-#define TG       (TG_M * TG_N)   // 256
+#define TG       (TG_M * TG_N)   // 512
 
 #define Q8_QK         32u
 #define Q8_BLOCK_SIZE 34u   // 2 (f16 scale) + 32 (int8 quants)
@@ -86,20 +91,21 @@ void main(uint3 gid : SV_GroupID, uint3 gtid : SV_GroupThreadID) {
     const uint tile_m_base = gid.y * TM;
     const uint tile_n_base = gid.x * TN;
 
-    // sa load mapping: tid = row*4 + quarter. 64 rows × 4 threads = 256 threads.
+    // sa load mapping: tid = row*4 + quarter. 128 rows × 4 threads = 512 threads.
     // Each thread loads 8 quants (2 packed dwords) covering 8 of the 32 quants
     // of one row. Quarter (0..3) selects which 8-quant chunk.
-    const uint sa_row     = tid >> 2u;       // 0..63
+    const uint sa_row     = tid >> 2u;       // 0..127
     const uint sa_q       = tid & 3u;        // 0..3
     const uint sa_k_base  = sa_q * 8u;       // 0,8,16,24
     const uint sa_gm      = tile_m_base + sa_row;
     const uint sa_row_base = src0_base + sa_gm * src0_nb1;
 
-    // sb load mapping: tid = col*4 + quarter. 64 cols × 4 threads = 256 threads.
-    // Each thread loads 8 K-elements (2 Load4s) of one col.
-    const uint sb_col     = tid >> 2u;       // 0..63
-    const uint sb_q       = tid & 3u;        // 0..3
-    const uint sb_k_base  = sb_q * 8u;
+    // sb load mapping: tid = col*8 + chunk. 64 cols × 8 threads = 512 threads.
+    // Each thread loads 4 K-elements (1 Load4) of one col. Chunk (0..7)
+    // selects which 4-K-element block.
+    const uint sb_col     = tid >> 3u;       // 0..63
+    const uint sb_q       = tid & 7u;        // 0..7
+    const uint sb_k_base  = sb_q * 4u;       // 0,4,...,28
     const uint sb_gn      = tile_n_base + sb_col;
     const uint sb_col_base = src1_base + sb_gn * K * 4u;
 
@@ -150,17 +156,12 @@ void main(uint3 gid : SV_GroupID, uint3 gtid : SV_GroupThreadID) {
             const uint k_start  = k0 + sb_k_base;
             const uint load_off = sb_col_base + k_start * 4u;
             const uint4 v0 = src1_buf.Load4(load_off);
-            const uint4 v1 = src1_buf.Load4(load_off + 16u);
             sb[sb_k_base + 0u][sb_col] = asfloat(v0.x);
             sb[sb_k_base + 1u][sb_col] = asfloat(v0.y);
             sb[sb_k_base + 2u][sb_col] = asfloat(v0.z);
             sb[sb_k_base + 3u][sb_col] = asfloat(v0.w);
-            sb[sb_k_base + 4u][sb_col] = asfloat(v1.x);
-            sb[sb_k_base + 5u][sb_col] = asfloat(v1.y);
-            sb[sb_k_base + 6u][sb_col] = asfloat(v1.z);
-            sb[sb_k_base + 7u][sb_col] = asfloat(v1.w);
         } else {
-            [unroll] for (uint i = 0u; i < 8u; ++i) {
+            [unroll] for (uint i = 0u; i < 4u; ++i) {
                 sb[sb_k_base + i][sb_col] = 0.0f;
             }
         }
