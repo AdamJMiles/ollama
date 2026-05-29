@@ -27,6 +27,7 @@ struct options {
     std::string target = "cs_6_6";
     bool        debug = false;
     bool        depfile_set = false;
+    bool        no_precompile = false;
 };
 
 struct shader_source {
@@ -93,7 +94,7 @@ private:
 
 std::string usage() {
     return "usage: d3d12-shaders-gen.exe --input-dir <dir> --output <ggml-d3d12-shaders.hpp> "
-           "--dxc <path\\to\\dxc.exe> [--target cs_6_6] [--debug] [--depfile <path>]";
+           "--dxc <path\\to\\dxc.exe> [--target cs_6_6] [--debug] [--depfile <path>] [--noprecompile]";
 }
 
 bool starts_with_flag_prefix(const std::string & value) {
@@ -107,6 +108,7 @@ bool parse_args(int argc, char ** argv, options & opts, std::string & error) {
     bool seen_target = false;
     bool seen_debug = false;
     bool seen_depfile = false;
+    bool seen_no_precompile = false;
 
     auto require_value = [&](int & index, const std::string & flag, std::string & value) -> bool {
         if (index + 1 >= argc || starts_with_flag_prefix(argv[index + 1])) {
@@ -188,6 +190,13 @@ bool parse_args(int argc, char ** argv, options & opts, std::string & error) {
             opts.depfile = fs::path(value);
             opts.depfile_set = true;
             seen_depfile = true;
+        } else if (arg == "--noprecompile") {
+            if (seen_no_precompile) {
+                error = "duplicate flag --noprecompile";
+                return false;
+            }
+            opts.no_precompile = true;
+            seen_no_precompile = true;
         } else if (starts_with_flag_prefix(arg)) {
             error = "unknown flag " + arg;
             return false;
@@ -555,6 +564,14 @@ compiled_shader compile_shader(
             command_line += " -enable-16bit-types";
         }
         command_line += opts.debug ? " -Zi -Qembed_debug -Od" : " -O3";
+        if (opts.no_precompile) {
+            // Required when invoking the GDK Scarlett/XboxOne DXC against a
+            // standard SM (cs_6_6) target: the GDK DXC otherwise tries to
+            // precompile the shader into Xbox-native bytecode and fails on
+            // shaders that lack an embedded root signature (we attach root
+            // sigs programmatically at runtime instead).
+            command_line += " -noprecompile";
+        }
         command_line += " " + quote_arg(source.path.string());
 
         const process_result result = run_process_capture(command_line);
